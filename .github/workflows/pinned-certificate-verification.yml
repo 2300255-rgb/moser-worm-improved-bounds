@@ -1,0 +1,119 @@
+
+name: Pinned certificate verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lower-certificate-audit:
+    name: Lower certificate audit (pinned source)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out exact pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+
+      - name: Assert source revision
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+        shell: bash
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install elan and Lean
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.1
+          "$HOME/.elan/bin/lean" --version
+
+      - name: Fetch mathlib build cache
+        shell: bash
+        run: |
+          set -o pipefail
+          lake exe cache get 2>&1 | tee lake-cache-get.log
+
+      - name: Verify lower certificate
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: "2"
+        run: |
+          set -o pipefail
+          python scripts/lower/verify.py --jobs 2 2>&1 | tee lower-verify.log
+
+      - name: Upload lower logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lower-certificate-audit-logs
+          path: |
+            lake-cache-get.log
+            lower-verify.log
+            .lake/logs/lower/
+          if-no-files-found: warn
+          retention-days: 14
+
+  upper-certificate-audit:
+    name: Upper certificate audit (pinned source)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out exact pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+
+      - name: Assert source revision
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+        shell: bash
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install elan and Lean
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.1
+          "$HOME/.elan/bin/lean" --version
+
+      - name: Fetch mathlib build cache
+        shell: bash
+        run: |
+          set -o pipefail
+          lake exe cache get 2>&1 | tee lake-cache-get.log
+
+      - name: Verify upper certificate
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: "2"
+        run: |
+          set -o pipefail
+          python scripts/upper/verify.py --jobs 1 2>&1 | tee upper-verify.log
+
+      - name: Upload upper logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upper-certificate-audit-logs
+          path: |
+            lake-cache-get.log
+            upper-verify.log
+            .lake/logs/upper/
+          if-no-files-found: warn
+          retention-days: 14
