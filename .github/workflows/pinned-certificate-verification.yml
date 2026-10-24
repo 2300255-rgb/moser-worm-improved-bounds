@@ -1,4 +1,3 @@
-
 name: Pinned certificate verification
 
 on:
@@ -20,8 +19,8 @@ jobs:
           persist-credentials: false
 
       - name: Assert source revision
-        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
         shell: bash
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
 
       - uses: actions/setup-python@v5
         with:
@@ -33,9 +32,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf \
             https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
             | sh -s -- -y --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.1
-          "$HOME/.elan/bin/lean" --version
+          elan toolchain install leanprover/lean4:v4.33.1
+          lean --version
+          lake --version
 
       - name: Fetch mathlib build cache
         shell: bash
@@ -75,8 +76,8 @@ jobs:
           persist-credentials: false
 
       - name: Assert source revision
-        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
         shell: bash
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
 
       - uses: actions/setup-python@v5
         with:
@@ -88,9 +89,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf \
             https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
             | sh -s -- -y --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.1
-          "$HOME/.elan/bin/lean" --version
+          elan toolchain install leanprover/lean4:v4.33.1
+          lean --version
+          lake --version
 
       - name: Fetch mathlib build cache
         shell: bash
