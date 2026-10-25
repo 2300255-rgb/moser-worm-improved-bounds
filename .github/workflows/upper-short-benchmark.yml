@@ -1,0 +1,112 @@
+name: Upper short benchmark (no full verification)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upper-benchmark:
+    name: Upper bounded performance benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+
+      - name: Assert pinned revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install pinned Lean toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lean --version
+
+      - name: Restore mathlib cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          lake exe cache get 2>&1 | tee upper-benchmark-cache.log
+
+      - name: Generate upper proof modules and benchmark three shards
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee upper-benchmark.log
+          import json, os, subprocess, sys, time
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export, SHARD_SIZE
+          from common import ROOT, source_snapshot
+
+          cert = ROOT / 'certificates/upper'
+          out = ROOT / 'MoserWorm/UpperBound/Certificate/Generated'
+          snapshot_before = source_snapshot()
+          input_before, header, _ = inputs(cert)
+          assert header['complete'] is True, 'Upper input certificate incomplete'
+          print('source:', subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(), flush=True)
+          print('cpus:', len(os.sched_getaffinity(0)), flush=True)
+          print('sample:', ['Shard0','Shard1','Shard2'], flush=True)
+          def timed(label, args, limit):
+              print('BEGIN', label, flush=True)
+              t = time.monotonic()
+              try:
+                  p = subprocess.run(args, cwd=ROOT, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, text=True, timeout=limit,
+                      env={**os.environ, 'LEAN_NUM_THREADS':'2'})
+                  print('END', label, 'seconds=',round(time.monotonic()-t,2), 'exit=',p.returncode, flush=True)
+                  print(p.stdout[-2500:], flush=True)
+                  if p.returncode: raise RuntimeError(label+' failed')
+              except subprocess.TimeoutExpired as e:
+                  print('TIMEOUT',label,'seconds=',round(time.monotonic()-t,2),flush=True)
+                  raise
+          timed('soundness', ['lake','build',
+              'MoserWorm.UpperBound.Certificate.Kernel.Header',
+              'MoserWorm.UpperBound.Certificate.Extraction',
+              'MoserWorm.UpperBound.Certificate.GeometricSound'], 360)
+          start=time.monotonic()
+          manifest=export(cert,out)
+          print('EXPORT seconds=',round(time.monotonic()-start,2),
+              'modules=',len(manifest['modules']), 'complete=',manifest.get('complete'), flush=True)
+          assert manifest.get('complete') is True
+          assert manifest.get('inputs') == input_before
+          assert manifest.get('shard_size') == SHARD_SIZE
+          names={m['name'] for m in manifest['modules']}
+          for shard in ('Shard0','Shard1','Shard2'):
+              name='MoserWorm.UpperBound.Certificate.Generated.'+shard
+              assert name in names, name
+              timed(shard, ['lake','build',name], 300)
+          assert source_snapshot()==snapshot_before, 'Source changed during benchmark'
+          assert inputs(cert)[0]==input_before, 'Certificate changed during benchmark'
+          print('BENCHMARK COMPLETE; THIS IS NOT AN UPPER CERTIFICATE PASS',flush=True)
+          PY
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upper-short-benchmark-logs
+          path: |
+            upper-benchmark.log
+            upper-benchmark-cache.log
+          if-no-files-found: warn
+          retention-days: 14
