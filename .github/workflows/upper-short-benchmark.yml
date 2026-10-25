@@ -53,6 +53,7 @@ jobs:
           python3 - <<'PY' 2>&1 | tee upper-benchmark.log
           import json, os, subprocess, sys, time
           from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
           sys.path.insert(0, str(Path('scripts/upper').resolve()))
           from exact import inputs
           from export import export, SHARD_SIZE
