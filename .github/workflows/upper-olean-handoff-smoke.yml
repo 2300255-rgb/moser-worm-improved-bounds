@@ -1,0 +1,183 @@
+name: Upper OLean handoff smoke test (not full verification)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  producer:
+    name: Build two shards and package Lean artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Lean 4.33.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+      - name: Get mathlib cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Generate exact upper sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export, SHARD_SIZE
+          from common import ROOT
+          c=ROOT/'certificates/upper'
+          snapshot,header,_=inputs(c)
+          assert header['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==snapshot and m['shard_size']==SHARD_SIZE
+          print('Generated',len(m['modules']),'modules')
+          PY
+      - name: Build sample modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          lake build MoserWorm.UpperBound.Certificate.Generated.Shard0 MoserWorm.UpperBound.Certificate.Generated.Shard1 2>&1 | tee producer-build.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          base=Path('.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated')
+          files=sorted(base.glob('*.olean'))
+          assert all((base/f'Shard{i}.olean').is_file() for i in (0,1))
+          assert all((base/f'{x}.olean').is_file() for x in ('Data','Tries'))
+          print('OLEANS',len(files))
+          Path('producer-olean-hashes.json').write_text(json.dumps({str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upper-olean-sample
+          path: |
+            .lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/
+            producer-olean-hashes.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-olean-producer-logs
+          path: |
+            producer-build.log
+            mathlib-cache.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  consumer:
+    name: Test artifact reuse in clean runner
+    needs: producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Lean 4.33.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+      - name: Get mathlib cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Generate exact upper sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export, SHARD_SIZE
+          from common import ROOT
+          c=ROOT/'certificates/upper'
+          snapshot,header,_=inputs(c)
+          assert header['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==snapshot and m['shard_size']==SHARD_SIZE
+          print('Generated',len(m['modules']),'modules')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: upper-olean-sample
+          path: .
+      - name: Check transferred hashes before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,hashlib
+          from pathlib import Path
+          expected=json.loads(Path('producer-olean-hashes.json').read_text())
+          assert expected and all(Path(k).is_file() for k in expected)
+          assert all(hashlib.sha256(Path(k).read_bytes()).hexdigest()==v for k,v in expected.items())
+          print('TRANSFER_HASHES_OK',len(expected))
+          PY
+      - name: Test Lake --rehash with transferred sample modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          lake --rehash build MoserWorm.UpperBound.Certificate.Generated.Shard0 MoserWorm.UpperBound.Certificate.Generated.Shard1 2>&1 | tee consumer-rehash.log
+          python3 - <<'PY'
+          import json,hashlib
+          from pathlib import Path
+          expected=json.loads(Path('producer-olean-hashes.json').read_text())
+          changed=[k for k,v in expected.items() if not Path(k).exists() or hashlib.sha256(Path(k).read_bytes()).hexdigest()!=v]
+          log=Path('consumer-rehash.log').read_text()
+          rebuilt=[name for name in ('Data','Tries','Shard0','Shard1') if
+             ('Built MoserWorm.UpperBound.Certificate.Generated.'+name+' ') in log]
+          print('HASHES_CHANGED_AFTER_REHASH',len(changed))
+          print('TRANSFERRED_MODULES_REBUILT',rebuilt)
+          for k in changed[:20]: print('CHANGED',k)
+          assert not rebuilt, 'Lake rebuilt transferred modules; reuse failed'
+          print('SMOKE_REUSE_PASS; NOT UPPER COMPLETE')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-olean-consumer-logs
+          path: |
+            consumer-rehash.log
+            mathlib-cache.log
+            producer-olean-hashes.json
+          if-no-files-found: warn
+          retention-days: 7
