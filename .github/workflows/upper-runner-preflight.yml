@@ -1,0 +1,47 @@
+name: Upper runner preflight (no certificate verification)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upper-preflight:
+    name: Upper worker capacity diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - name: Assert pinned revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "9a3394130fe4f7b1df6ffdeffda16601795d9ce4"
+      - name: Check available resources and upstream worker policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import subprocess
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          from common import memory_budget, worker_count
+          print('pinned source:', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
+          print('CPU affinity:', len(os.sched_getaffinity(0)), flush=True)
+          print('memory budget GiB:', round(memory_budget() / 2**30, 3), flush=True)
+          for requested in (1, 2, 3, 4):
+              try:
+                  actual = worker_count(requested, 12, 7 * 2**30)
+                  print(f'Upper requested jobs={requested}, effective jobs={actual}', flush=True)
+              except Exception as exc:
+                  print(f'Upper requested jobs={requested}, error={type(exc).__name__}: {exc}', flush=True)
+          PY
+          echo 'Disk:'
+          df -h .
+          echo 'Cgroup memory limit:'
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || true
