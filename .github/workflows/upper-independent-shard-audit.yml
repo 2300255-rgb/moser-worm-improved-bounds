@@ -1,0 +1,130 @@
+name: Upper independent shard audit (not full verification)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shard-check:
+    name: Upper shard group ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install pinned Lean and cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Verify assigned shards independently
+        shell: bash
+        env:
+          GROUP: ${{ matrix.group }}
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess,sys,time,traceback
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          group=int(os.environ['GROUP']); assert 0<=group<4
+          cert=ROOT/'certificates/upper'
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          source_before=source_snapshot()
+          input_before,header,_=inputs(cert)
+          assert header['complete'] is True
+          manifest=export(cert,out)
+          assert manifest['complete'] is True and manifest['inputs']==input_before and manifest['shard_size']==SHARD_SIZE
+          shards=sorted((m['name'] for m in manifest['modules'] if m['name'].rsplit('.',1)[-1].startswith('Shard')),key=lambda x:int(x.rsplit('Shard',1)[-1]))
+          assert len(shards)==manifest['shards']==1583
+          assert [int(s.rsplit('Shard',1)[-1]) for s in shards]==list(range(1583))
+          selected=[name for i,name in enumerate(shards) if i%4==group]
+          record={'group':group,'commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4','manifest_sha256':hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest(),'source_sha256':source_before['sha256'],'inputs_sha256':input_before['sha256'],'expected':selected,'completed':[],'complete':False}
+          dest=Path('group-result.json')
+          def write():dest.write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
+          write()
+          try:
+              for i,name in enumerate(selected,1):
+                  start=time.monotonic()
+                  with open('current-build.log','w') as log:
+                      p=subprocess.run(['lake','build',name],stdout=log,stderr=subprocess.STDOUT,env={**os.environ,'LEAN_NUM_THREADS':'2'})
+                  if p.returncode:
+                      print(Path('current-build.log').read_text()[-6000:],flush=True)
+                      raise RuntimeError(f'Lean failed for {name} exit={p.returncode}')
+                  record['completed'].append(name)
+                  write()
+                  if i==1 or i%20==0 or i==len(selected):print(f'GROUP {group}: {i}/{len(selected)} last={name} seconds={time.monotonic()-start:.1f}',flush=True)
+              assert source_snapshot()==source_before,'source changed'
+              assert inputs(cert)[0]==input_before,'certificate changed'
+              record['complete']=True
+              write()
+              print('SHARD_GROUP_PASS',group,len(selected),flush=True)
+          except BaseException:
+              traceback.print_exc()
+              write()
+              raise
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-shard-group-${{ matrix.group }}
+          path: |
+            group-result.json
+            current-build.log
+          if-no-files-found: warn
+          retention-days: 14
+  audit:
+    name: Audit all shard groups (not final theorem)
+    needs: shard-check
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: upper-shard-group-*
+          path: groups
+          merge-multiple: false
+      - name: Audit exact shard coverage and matching inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          names=[]; fingerprints=set()
+          for i in range(4):
+              path=Path(f'groups/upper-shard-group-{i}/group-result.json')
+              assert path.is_file(),f'missing result for group {i}'
+              r=json.loads(path.read_text())
+              assert r['group']==i and r['complete'] is True,f'incomplete group {i}'
+              assert r['completed']==r['expected'],f'partial group {i}'
+              assert len(r['completed'])==len(set(r['completed']))
+              fingerprints.add((r['commit'],r['manifest_sha256'],r['source_sha256'],r['inputs_sha256']))
+              names.extend(r['completed'])
+              print('GROUP',i,'verified',len(r['completed']))
+          assert len(fingerprints)==1,'different sources/certificates/manifests across groups'
+          assert len(names)==1583 and len(set(names))==1583,'duplicate or missing shards'
+          ns='MoserWorm.UpperBound.Certificate.Generated.Shard'
+          assert set(names)=={ns+str(i) for i in range(1583)},'shard coverage mismatch'
+          print('ALL_1583_SHARDS_AUDIT_PASS')
+          print('THIS DOES NOT VERIFY Tree, Assembly, Main OR THE FULL UPPER CERTIFICATE')
+          PY
