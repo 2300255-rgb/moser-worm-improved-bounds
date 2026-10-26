@@ -1,0 +1,277 @@
+name: Upper freeze evidence from completed run (audit only)
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  audit-existing-run:
+    name: Independently hash existing shards and archive audit report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout immutable upstream source
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Download original shard artifacts (no recompilation)
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 40331523856
+          github-token: ${{ github.token }}
+          pattern: upper-shard-oleans-*
+          path: received
+          merge-multiple: false
+      - name: Download original final logs
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 40331523856
+          github-token: ${{ github.token }}
+          name: upper-final-integration-logs
+          path: upstream-run-logs
+      - name: Download original shard logs
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 40331523856
+          github-token: ${{ github.token }}
+          pattern: upper-shard-logs-*
+          path: shard-logs
+          merge-multiple: false
+      - name: Pin original workflow and GitHub run outcome
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request,json,os,base64
+          root='https://api.github.com/repos/'+os.environ['TARGET_REPO']
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],
+                   'Accept':'application/vnd.github+json',
+                   'X-GitHub-Api-Version':'2022-11-28'}
+          def get(path):
+              request=urllib.request.Request(root+path,headers=headers)
+              with urllib.request.urlopen(request,timeout=50) as resp:
+                  return json.load(resp)
+          run=get('/actions/runs/40331523856')
+          assert run.get('conclusion')=='success','original run not successful'
+          assert run.get('status')=='completed','original run incomplete'
+          assert run.get('event')=='workflow_dispatch'
+          jobs=get('/actions/runs/40331523856/jobs?per_page=100')['jobs']
+          assert len(jobs)==5 and all(j['conclusion']=='success' for j in jobs)
+          expected={'Export and verify shard group '+str(i) for i in range(4)}
+          expected.add('Check all shard artifacts and compile final theorem')
+          assert {j['name'] for j in jobs}==expected
+          path='.github/workflows/upper-complete-integration-attempt.yml'
+          raw=get('/contents/'+path+'?ref='+run['head_sha'])
+          assert raw.get('encoding')=='base64'
+          open('original-workflow.yml','wb').write(base64.b64decode(raw['content']))
+          evidence={'run_id':40331523856,'run_html_url':run['html_url'],
+                    'head_sha':run['head_sha'],'run_conclusion':run['conclusion'],
+                    'run_created_at':run['created_at'],
+                    'jobs':[{'id':j['id'],'name':j['name'],'conclusion':j['conclusion']} for j in jobs]}
+          open('original-run-status.json','w').write(json.dumps(evidence,indent=2)+'\n')
+          print('ORIGINAL_RUN_GITHUB_API_SUCCESS',flush=True)
+          PY
+      - name: Write the independently reviewable audit program
+        shell: bash
+        run: |
+          cat > audit_existing_artifacts.py <<'PY'
+          #!/usr/bin/env python3
+          """Independently audit existing GitHub Actions run 40331523856 artifacts.
+
+          This checks reproducibility of source/certificate fingerprints and *all* 1,583
+          transferred .olean files, with a direct comparison to the prior run's logs.
+          It does not rerun Lean, and is not a substitute for kernel compilation.
+          """
+          from __future__ import annotations
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from datetime import datetime, timezone
+
+          RUN_ID = 40331523856
+          COMMIT = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          N_SHARDS = 1583
+          N_MODULES = 1636
+          GEN = 'MoserWorm.UpperBound.Certificate.Generated.'
+
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with Path(path).open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def require(ok, msg):
+              if not ok:
+                  raise RuntimeError(msg)
+
+
+          def main():
+              repo = Path.cwd()
+              directory = repo / 'MoserWorm/UpperBound/Certificate/Generated'
+              logs = repo / 'upstream-run-logs'
+              received = repo / 'received'
+              sys.path.insert(0, str(repo / 'scripts'))
+              sys.path.insert(0, str(repo / 'scripts/upper'))
+              from common import ROOT, source_snapshot
+              from exact import inputs
+              from export import export, SHARD_SIZE
+              require(ROOT == repo, 'Run from pinned checkout repository root')
+              actual_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              require(actual_commit == COMMIT, 'Incorrect source commit')
+              original_source = source_snapshot()
+              original_inputs, h, _ = inputs(repo / 'certificates/upper')
+              require(h['complete'] is True, 'Certificate header incomplete')
+              manifest = export(repo / 'certificates/upper', directory)
+              require(manifest.get('complete') is True, 'Generated manifest incomplete')
+              require(manifest.get('inputs') == original_inputs, 'Manifest input mismatch')
+              require(manifest.get('shard_size') == SHARD_SIZE, 'Shard size mismatch')
+              require(manifest.get('shards') == N_SHARDS, 'Unexpected shard count')
+              require(len(manifest['modules']) == N_MODULES, 'Unexpected module count')
+              require(len(manifest['sha256']) == N_MODULES, 'Missing generated source hashes')
+              for name, digest in manifest['sha256'].items():
+                  path = directory / (name.rsplit('.', 1)[-1] + '.lean')
+                  require(path.is_file() and sha256(path) == digest, 'Generated source hash mismatch: ' + name)
+              man_sha = sha256(directory / 'manifest.json')
+              src_sha = original_source['sha256']
+              inp_sha = original_inputs['sha256']
+              expected_fingerprints = {
+                  'source': src_sha, 'inputs': inp_sha, 'manifest': man_sha,
+              }
+              audit_file = logs / 'transfer-audit.json'
+              require(audit_file.is_file(), 'Missing original transfer-audit.json')
+              prev = json.loads(audit_file.read_text())
+              for field in ('source','inputs','manifest'):
+                  require(prev[field] == expected_fingerprints[field], 'Original transfer-audit mismatch: '+field)
+              require(prev.get('verified') is True and prev.get('shards') == N_SHARDS,
+                      'Original transfer audit did not confirm all shards')
+              # Verify 4 group records against the regenerated inputs and every archived .olean.
+              collected = {}
+              groups = []
+              for g in range(4):
+                  folder = received / f'upper-shard-oleans-{g}'
+                  record = folder / 'group-record.json'
+                  require(record.is_file(), f'Missing group-record.json for {g}')
+                  data = json.loads(record.read_text())
+                  require(data.get('group') == g and data.get('complete') is True,
+                          f'Group {g} incomplete')
+                  require(data.get('commit') == COMMIT, f'Group {g} wrong commit')
+                  for k, digest in expected_fingerprints.items():
+                      require(data.get(k) == digest, f'Group {g} fingerprint mismatch: {k}')
+                  short_names = [f'Shard{i}' for i in range(N_SHARDS) if i % 4 == g]
+                  full_names = [GEN+n for n in short_names]
+                  require(data.get('expected') == data.get('verified') == full_names,
+                          f'Group {g} coverage mismatch')
+                  hashes = data.get('hashes', {})
+                  require(set(hashes) == set(short_names), f'Group {g} hash-name mismatch')
+                  group_total_bytes = 0
+                  for short in short_names:
+                      filename = folder / '.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated' / (short+'.olean')
+                      require(filename.is_file(), 'Missing .olean: ' + str(filename))
+                      require(filename.stat().st_size > 0, 'Zero-length .olean: ' + short)
+                      digest = sha256(filename)
+                      require(digest == hashes[short], f'.olean SHA256 mismatch: {short}')
+                      require(short not in collected, 'Duplicate shard: '+short)
+                      collected[short] = {'group':g, 'sha256':digest, 'size':filename.stat().st_size}
+                      group_total_bytes += filename.stat().st_size
+                  groups.append({'group':g,'count':len(short_names),'bytes':group_total_bytes,
+                                 'group_record_sha256':sha256(record)})
+              require(set(collected) == {f'Shard{i}' for i in range(N_SHARDS)}, 'Shard gaps found')
+              # Compare final compilation status precisely to the manifest's non-shard modules.
+              progress_file = logs / 'final-progress.log'
+              require(progress_file.is_file(), 'Missing final-progress.log')
+              progress = progress_file.read_text()
+              generated = [n.rsplit('.',1)[-1] for n in (x['name'] for x in manifest['modules'])]
+              extras = [s for s in generated if not (s.startswith('Shard') and s[5:].isdigit())]
+              require(len(extras) == N_MODULES-N_SHARDS, 'Incorrect non-shard module count')
+              for short in extras + ['Main']:
+                  require(len(re.findall(r'^BEGIN '+re.escape(short)+r'\s*$', progress, re.M)) == 1,
+                          'Missing/duplicate BEGIN: '+short)
+                  require(len(re.findall(r'^PASS '+re.escape(short)+r' seconds ', progress, re.M)) == 1,
+                          'Missing/duplicate PASS: '+short)
+              require('UPPER_FINAL_DIRECT_LEAN_PASS; REVIEW AXIOM AUDIT AND UPSTREAM EQUIVALENCE' in progress,
+                      'Missing final marker')
+              for f, needles in {
+                  'soundness-build.log': ['Certificate.GeometricSound', 'Build completed successfully'],
+                  'audit-deps.log': ['MoserWorm.Common.Audit', 'Build completed successfully'],
+              }.items():
+                  require(all(needle in (logs/f).read_text() for needle in needles),
+                          'Missing soundness/audit dependency build evidence: '+f)
+              require((logs / 'last-final-lean.log').is_file(), 'Missing final Lean compiler log')
+              require(source_snapshot() == original_source, 'Sources changed during audit')
+              require(inputs(repo / 'certificates/upper')[0] == original_inputs,
+                      'Certificates changed during audit')
+              result = {
+                  'schema':1, 'run_id':RUN_ID,
+                  'upstream_commit':COMMIT,
+                  'audited_at_utc':datetime.now(timezone.utc).isoformat(),
+                  'source_sha256':src_sha,'certificate_input_sha256':inp_sha,
+                  'generated_manifest_sha256':man_sha,
+                  'generated_module_count':N_MODULES, 'shard_count':N_SHARDS,
+                  'non_shard_generated_module_count':len(extras),
+                  'groups':groups,
+                  'shard_olean_hashes':collected,
+                  'non_shard_modules':extras,
+                  'main_compiler_exit_status':'success indicated by prior successful GitHub Actions job; not rerun in this audit',
+                  'axiom_audit':'Main.lean compiled successfully in original run; inspect pinned source for audit_axioms definition',
+                  'conclusion':'ARTIFACT_AND_LOG_AUDIT_PASS',
+                  'limits':['No new Lean compilation','Not upstream verify.py literal execution',
+                            'No exact reproducibility guarantee for binary .olean bytes on other systems'],
+              }
+              Path('audit-evidence.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+              Path('audit-summary.md').write_text(
+                  '# Upper certificate: artifact audit\n\n'
+                  f'- Original GitHub Actions run: https://github.com/2300255-rgb/moser-worm-improved-bounds/actions/runs/{RUN_ID}\n'
+                  f'- Pinned upstream commit: `{COMMIT}`\n'
+                  f'- Source SHA256: `{src_sha}`\n'
+                  f'- Certificate input SHA256: `{inp_sha}`\n'
+                  f'- Manifest SHA256: `{man_sha}`\n'
+                  f'- Generated module source hashes verified: **{N_MODULES}**\n'
+                  f'- Shard `.olean` artifacts checked by SHA256: **{N_SHARDS}**\n'
+                  f'- Remaining generated compilation pass markers: **{len(extras)}**\n'
+                  '- Final `Main` compilation pass marker: **present**\n'
+                  '- Original run reported success. No Lean recomputation was performed by this audit.\n'
+                  '- Independent claim: **ARTIFACT_AND_LOG_AUDIT_PASS**.\n'
+                  '- The compiled final theorem and the original `audit_axioms` check were part of the successful original run.\n'
+                  '- Literal upstream `verify.py` execution was not performed. Thus strict procedural equivalence remains **HOLD**.\n'
+              )
+              print('ARTIFACT_AND_LOG_AUDIT_PASS',len(collected),'shards',len(extras),'other generated modules',flush=True)
+
+          if __name__ == '__main__':
+              main()
+          PY
+          python3 -m py_compile audit_existing_artifacts.py
+      - name: Verify all 1583 binaries and generated source hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 audit_existing_artifacts.py 2>&1 | tee audit-run.log
+      - name: Upload compact reproducibility and provenance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upper-proof-evidence-frozen
+          path: |
+            audit-run.log
+            audit-evidence.json
+            audit-summary.md
+            audit_existing_artifacts.py
+            original-run-status.json
+            original-workflow.yml
+            upstream-run-logs/
+            shard-logs/
+          if-no-files-found: warn
+          retention-days: 90
