@@ -1,0 +1,89 @@
+name: Upper final assembly pilot (not full verification)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pilot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install pinned Lean and restore cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Export, verify source fingerprints, and build common imports
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys,json,hashlib
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export, SHARD_SIZE
+          from common import ROOT, source_snapshot
+          before=source_snapshot(); cert=ROOT/'certificates/upper'
+          inp,header,_=inputs(cert)
+          assert header['complete'] is True
+          m=export(cert,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          assert source_snapshot()==before and inputs(cert)[0]==inp
+          Path('pilot-fingerprints.json').write_text(json.dumps({'source':before['sha256'],'inputs':inp['sha256'],'manifest':hashlib.sha256((ROOT/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()).hexdigest()},indent=2))
+          print('EXPORT_AND_INPUTS_PASS',flush=True)
+          PY
+          lake build MoserWorm.UpperBound.Certificate.Kernel.Header > pilot-shared-build.log 2>&1
+      - name: Compile sample using direct Lean
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          DIR=MoserWorm/UpperBound/Certificate/Generated
+          OUT=.lake/build/lib/lean/$DIR
+          mkdir -p "$OUT"
+          for module in Data Tries Shard0 Shard1; do
+            echo "BEGIN $module"
+            /usr/bin/time -f "elapsed=%e maxrss_kb=%M" lake env lean -o "$OUT/$module.olean" "$DIR/$module.lean" >> pilot-direct-lean.log 2>&1
+            test -s "$OUT/$module.olean"
+            echo "PASS $module"
+          done
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          base=Path('.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated')
+          names=['Data','Tries','Shard0','Shard1']
+          result={n: {'sha256':hashlib.sha256((base/(n+'.olean')).read_bytes()).hexdigest(),'bytes':(base/(n+'.olean')).stat().st_size} for n in names}
+          Path('pilot-output-hashes.json').write_text(json.dumps(result,indent=2))
+          print('DIRECT_SMALL_PILOT_PASS; THIS IS NOT UPPER CERTIFICATE PASS')
+          PY
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-final-assembly-pilot-logs
+          path: |
+            mathlib-cache.log
+            pilot-shared-build.log
+            pilot-direct-lean.log
+            pilot-fingerprints.json
+            pilot-output-hashes.json
+          if-no-files-found: warn
+          retention-days: 14
