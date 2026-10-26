@@ -1,0 +1,83 @@
+name: Upper pinned source and certificate preservation (audit only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preserve-pinned-upper-inputs:
+    name: Freeze immutable Upper source and certificate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact upstream commit
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Check source and certificate provenance; archive tracked inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, subprocess, sys, zipfile
+          from pathlib import Path
+          PIN='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          SRC='6bb6aea19cedc7d533eec5344eb8f552456c3c717e3f621009176755114171d9'
+          INP='f2d343224b0ba055cd530d5ded53e0c667c3cbbd30be2f2412906448cb39f0dc'
+          root=Path.cwd()
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==PIN
+          sys.path.insert(0,str((root/'scripts').resolve()))
+          sys.path.insert(0,str((root/'scripts/upper').resolve()))
+          from common import source_snapshot
+          from exact import inputs
+          sources=source_snapshot()
+          cert,header,_=inputs(root/'certificates/upper')
+          assert header['complete'] is True
+          assert sources['sha256']==SRC,('source snapshot mismatch',sources['sha256'])
+          assert cert['sha256']==INP,('certificate input mismatch',cert['sha256'])
+          files=[Path(p.decode('utf-8','surrogateescape')) for p in
+                 subprocess.check_output(['git','ls-files','-z']).split(b'\0') if p]
+          def keep(p):
+              s=p.as_posix()
+              # Exclude unrelated Lower certificate and GitHub workflow history;
+              # include all other tracked repository files relevant to Upper.
+              return not (s.startswith('certificates/lower/') or s.startswith('.github/'))
+          files=[p for p in files if keep(p)]
+          assert files and any(p.as_posix().startswith('certificates/upper/') for p in files)
+          assert (root/'MoserWorm/UpperBound/Main.lean') in [root/p for p in files]
+          out=Path('upper-pinned-source-certificate.zip')
+          inventory={}
+          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(files):
+                  if not p.is_file(): raise RuntimeError('Tracked file unavailable: '+str(p))
+                  b=p.read_bytes()
+                  inventory[p.as_posix()]={'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()}
+                  z.write(p,p.as_posix())
+          with zipfile.ZipFile(out) as z:
+              assert len(z.namelist())==len(inventory)
+              assert set(z.namelist())==set(inventory)
+              assert z.testzip() is None
+          record={'schema':1,'pinned_commit':PIN,'source_snapshot_sha256':SRC,
+                  'certificate_input_fingerprint':INP,'file_count':len(files),
+                  'excluded':['certificates/lower/','.github/'],
+                  'files':inventory,'source_zip_sha256':hashlib.sha256(out.read_bytes()).hexdigest(),
+                  'notice':'Filtered pinned git checkout for reproducible Upper source/certificate retention; not a new Lean proof verification'}
+          Path('upper-pinned-source-inventory.json').write_text(json.dumps(record,indent=2,sort_keys=True)+'\n')
+          print('PINNED_UPPER_SOURCE_AND_CERTIFICATE_PASS files',len(files),'archive_bytes',out.stat().st_size,flush=True)
+          print('SOURCE_ZIP_SHA256',record['source_zip_sha256'],flush=True)
+          PY
+      - name: Upload pinned Upper input snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: upper-pinned-source-certificate
+          path: |
+            upper-pinned-source-certificate.zip
+            upper-pinned-source-inventory.json
+          if-no-files-found: error
+          retention-days: 90
