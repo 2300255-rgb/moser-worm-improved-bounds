@@ -1,0 +1,154 @@
+name: Upper direct Lean handoff smoke (not full verification)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  producer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Setup Lean and cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Export and build Shard0
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys,json,hashlib
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          from common import ROOT,source_snapshot
+          before=source_snapshot()
+          c=ROOT/'certificates/upper'
+          inp,header,_=inputs(c)
+          assert header['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          Path('handoff-fingerprint.json').write_text(json.dumps({'source':before['sha256'],'inputs':inp['sha256'],'manifest':hashlib.sha256((ROOT/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()).hexdigest()},indent=2))
+          PY
+          LEAN_NUM_THREADS=2 lake build MoserWorm.UpperBound.Certificate.Generated.Shard0 > producer-build.log 2>&1
+          python3 - <<'PY'
+          import json,hashlib
+          from pathlib import Path
+          base=Path('.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated')
+          keys=['Data.olean','Tries.olean','Shard0.olean']
+          assert all((base/k).is_file() for k in keys)
+          Path('producer-hashes.json').write_text(json.dumps({k:hashlib.sha256((base/k).read_bytes()).hexdigest() for k in keys},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: direct-lean-oleans
+          path: |
+            .lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/*.olean
+            producer-hashes.json
+            handoff-fingerprint.json
+          include-hidden-files: true
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: direct-lean-producer-logs
+          path: |
+            producer-build.log
+            mathlib-cache.log
+          if-no-files-found: warn
+  consumer:
+    needs: producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Setup Lean and cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Re-export exact sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          from common import ROOT
+          c=ROOT/'certificates/upper'
+          inp,h,_=inputs(c)
+          assert h['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: direct-lean-oleans
+          path: .
+      - name: Test Lean import without Lake build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys,json,hashlib
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from exact import inputs
+          from common import ROOT,source_snapshot
+          c=ROOT/'certificates/upper'
+          f=json.loads(Path('handoff-fingerprint.json').read_text())
+          assert source_snapshot()['sha256']==f['source']
+          assert inputs(c)[0]['sha256']==f['inputs']
+          assert hashlib.sha256((ROOT/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()).hexdigest()==f['manifest']
+          base=Path('.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated')
+          for name,sha in json.loads(Path('producer-hashes.json').read_text()).items():
+              assert hashlib.sha256((base/name).read_bytes()).hexdigest()==sha
+          print('TRANSFER_HASHES_AND_INPUTS_PASS',flush=True)
+          PY
+          # Build only non-generated shared dependencies; do not build generated Data/Tries/Shard0 using Lake.
+          LEAN_NUM_THREADS=2 lake build MoserWorm.UpperBound.Certificate.Kernel.Header > shared-build.log 2>&1
+          # Compile imported generated Shard1 DIRECTLY with Lean, bypassing Lake freshness scheduling.
+          # If transferred .olean files cannot be imported, Lean fails here.
+          LEAN_NUM_THREADS=2 lake env lean -o .lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Shard1.olean MoserWorm/UpperBound/Certificate/Generated/Shard1.lean > direct-lean.log 2>&1
+          test -s .lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Shard1.olean
+          echo 'DIRECT_LEAN_IMPORT_PASS; NOT FULL UPPER CERTIFICATE VERIFICATION'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: direct-lean-consumer-logs
+          path: |
+            direct-lean.log
+            shared-build.log
+            mathlib-cache.log
+          if-no-files-found: warn
