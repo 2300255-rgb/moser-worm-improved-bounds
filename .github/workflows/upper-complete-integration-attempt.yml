@@ -1,0 +1,251 @@
+name: Upper complete integration attempt (experimental)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shards:
+    name: Export and verify shard group ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Set up pinned Lean and mathlib
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Export and verify assigned shards, preserving olean files
+        shell: bash
+        env:
+          GROUP: ${{ matrix.group }}
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee shard-progress.log
+          import sys,os,json,hashlib,subprocess,time
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          group=int(os.environ['GROUP']); assert group in range(4)
+          src=source_snapshot(); cert=ROOT/'certificates/upper'
+          inp,h,_=inputs(cert); assert h['complete'] is True
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=export(cert,out)
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          ns='MoserWorm.UpperBound.Certificate.Generated.Shard'
+          names=[ns+str(i) for i in range(1583) if i%4==group]
+          actual={x['name'] for x in m['modules']}
+          assert set(names)<=actual
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          base.mkdir(parents=True,exist_ok=True)
+          rec={'group':group,'source':src['sha256'],'inputs':inp['sha256'],
+               'manifest':hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest(),
+               'commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+               'expected':names,'verified':[],'hashes':{},'complete':False}
+          dest=Path('group-record.json')
+          def save():dest.write_text(json.dumps(rec,sort_keys=True,indent=2)+'\n')
+          save()
+          # Build common prerequisites once, then compile assigned shards directly.
+          subprocess.run(['lake','build','MoserWorm.UpperBound.Certificate.Kernel.Header'],check=True,
+                         stdout=open('shared-build.log','w'),stderr=subprocess.STDOUT)
+          for mod in ('Data','Tries'):
+              subprocess.run(['lake','env','lean','-o',str(base/(mod+'.olean')),str(out/(mod+'.lean'))],check=True,
+                             stdout=open('common-direct.log','a'),stderr=subprocess.STDOUT)
+          for j,name in enumerate(names,1):
+              short=name.rsplit('.',1)[-1]; output=base/(short+'.olean')
+              with open('last-shard.log','w') as log:
+                  subprocess.run(['lake','env','lean','-o',str(output),str(out/(short+'.lean'))],
+                                 stdout=log,stderr=subprocess.STDOUT,check=True)
+              assert output.is_file() and output.stat().st_size>0
+              rec['hashes'][short]=hashlib.sha256(output.read_bytes()).hexdigest()
+              rec['verified'].append(name)
+              if j%10==0 or j==len(names):
+                  save(); print('GROUP',group,j,'/',len(names),flush=True)
+          assert source_snapshot()==src and inputs(cert)[0]==inp
+          rec['complete']=True; save()
+          print('GROUP_OLEAN_PASS',group,len(names),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upper-shard-oleans-${{ matrix.group }}
+          path: |
+            .lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Shard*.olean
+            group-record.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-shard-logs-${{ matrix.group }}
+          path: |
+            shard-progress.log
+            shared-build.log
+            common-direct.log
+            last-shard.log
+          if-no-files-found: warn
+          retention-days: 7
+  final:
+    name: Check all shard artifacts and compile final theorem
+    needs: shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Set up pinned Lean and mathlib
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Re-export sources and build shared soundness dependencies
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          c=ROOT/'certificates/upper'; inp,h,_=inputs(c)
+          assert h['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          PY
+          lake build MoserWorm.UpperBound.Certificate.Kernel.Header MoserWorm.UpperBound.Certificate.Extraction MoserWorm.UpperBound.Certificate.GeometricSound > soundness-build.log 2>&1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: upper-shard-oleans-*
+          path: received
+          merge-multiple: false
+      - name: Audit all 1583 transferred olean files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee transfer-audit.log
+          import json,hashlib,shutil,sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          base.mkdir(parents=True,exist_ok=True)
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          source=source_snapshot()['sha256']; inp=inputs(ROOT/'certificates/upper')[0]['sha256']
+          manifest=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          all_names=[]
+          for g in range(4):
+              folder=Path(f'received/upper-shard-oleans-{g}')
+              rec=json.loads((folder/'group-record.json').read_text())
+              assert rec['complete'] and rec['group']==g
+              assert (rec['source'],rec['inputs'],rec['manifest'])==(source,inp,manifest)
+              assert rec['commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+              expected=['MoserWorm.UpperBound.Certificate.Generated.Shard'+str(i) for i in range(1583) if i%4==g]
+              assert rec['expected']==rec['verified']==expected
+              assert set(rec['hashes'])=={'Shard'+str(i) for i in range(1583) if i%4==g}
+              for name,sha in rec['hashes'].items():
+                  src=folder/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'/(name+'.olean')
+                  assert src.is_file(),f'missing {src}'
+                  assert hashlib.sha256(src.read_bytes()).hexdigest()==sha,f'hash mismatch {name}'
+                  assert not (base/(name+'.olean')).exists(),f'duplicate {name}'
+                  shutil.copy2(src,base/(name+'.olean'))
+                  all_names.append(name)
+              print('TRANSFER GROUP PASS',g,len(rec['hashes']),flush=True)
+          assert set(all_names)=={'Shard'+str(i) for i in range(1583)} and len(all_names)==1583
+          Path('transfer-audit.json').write_text(json.dumps({'source':source,'inputs':inp,'manifest':manifest,'shards':1583,'verified':True},indent=2))
+          print('ALL_1583_OLEAN_TRANSFER_PASS',flush=True)
+          PY
+      - name: Compile remaining generated modules and final Main with direct Lean
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee final-progress.log
+          import json,subprocess,sys,time
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from graphlib import TopologicalSorter
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=json.loads((out/'manifest.json').read_text())
+          source_before=source_snapshot(); input_before=inputs(ROOT/'certificates/upper')[0]
+          graph={x['name']:set(x['dependencies']) for x in m['modules']}
+          order=list(TopologicalSorter(graph).static_order())
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          def compile(path,output,label):
+              print('BEGIN',label,flush=True)
+              start=time.monotonic()
+              with open('last-final-lean.log','w') as log:
+                  subprocess.run(['lake','env','lean','-o',str(output),str(path)],check=True,
+                                 stdout=log,stderr=subprocess.STDOUT)
+              assert output.is_file() and output.stat().st_size>0
+              print('PASS',label,'seconds',round(time.monotonic()-start,2),flush=True)
+          for name in order:
+              short=name.rsplit('.',1)[-1]
+              if short.startswith('Shard') and short[5:].isdigit():
+                  assert (base/(short+'.olean')).is_file()
+                  continue
+              compile(out/(short+'.lean'),base/(short+'.olean'),short)
+          # Main imports Assembly, Common.Audit and GeometricSound.
+          # Build Common.Audit explicitly without asking Lake to build Assembly.
+          subprocess.run(['lake','build','MoserWorm.Common.Audit'],check=True,
+                         stdout=open('audit-deps.log','w'),stderr=subprocess.STDOUT)
+          main=ROOT/'MoserWorm/UpperBound/Main.lean'
+          compile(main,ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Main.olean','Main')
+          assert source_snapshot()==source_before and inputs(ROOT/'certificates/upper')[0]==input_before
+          print('UPPER_FINAL_DIRECT_LEAN_PASS; REVIEW AXIOM AUDIT AND UPSTREAM EQUIVALENCE',flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-final-integration-logs
+          path: |
+            mathlib-cache.log
+            soundness-build.log
+            transfer-audit.log
+            transfer-audit.json
+            final-progress.log
+            last-final-lean.log
+            audit-deps.log
+          if-no-files-found: warn
+          retention-days: 14
