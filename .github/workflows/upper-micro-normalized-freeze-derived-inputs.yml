@@ -1,0 +1,161 @@
+# Archive exactly the derived inputs that led to the successful 2026-10-28 Upper Lean proof.
+# This does not rerun the Lean proof and does not modify the original upstream commit.
+name: Freeze normalized micro Upper source and certificate (audit only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  archive-derived-inputs:
+    name: Recreate and archive exact normalized derived inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact experimental harness
+        uses: actions/checkout@v4
+        with:
+          ref: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable original upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Recreate normalized derived source, certificate, and generation manifest
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json > derivation.log 2>&1
+          python3 ../harness/.github/scripts/normalize_derived_multipliers.py \
+            --root . --derive-report micro-derived-input-report.json \
+            --report micro-normalization-report.json \
+            --csv micro-normalization-per-leaf.csv > normalization.log 2>&1
+          python3 ../harness/.github/scripts/validate_derived_candidate.py \
+            --root . --skip-export --report micro-numeric-preflight.json > numerics.log 2>&1
+          python3 - <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from export import export
+          d=json.loads(Path('micro-derived-input-report.json').read_text())
+          n=json.loads(Path('micro-normalization-report.json').read_text())
+          q=json.loads(Path('micro-numeric-preflight.json').read_text())
+          assert (d['delta2'],d['delta3'])==('1/30000000','1/30000000')
+          assert d['upstream_commit']==n['upstream_commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          assert d['exact_area']=='70988942955609283719006199/288183770260848000000000000'
+          assert n['normalized_all_LB_equal_1'] is True and n['number_of_leaves']==12663
+          assert q['number_of_leaves']==12663 and q['numerically_failed_leaves']==0
+          assert source_snapshot()['sha256']==n['derived_source_fingerprint']==q['source_fingerprint']=='1bbf49771dce22c70d5a6087c61940e068fc615c07079526809c22d28851611d'
+          c,header,_=inputs(ROOT/'certificates/upper')
+          assert c['sha256']==n['normalized_certificate_fingerprint']==q['certificate_fingerprint']=='182edf6da38446623a3b3c288aa49097402cc430146d00688e6135f52d0c27e5'
+          assert header['complete'] is True
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=export(ROOT/'certificates/upper',out)
+          assert m['complete'] is True and m['shards']==1583 and len(m['modules'])==1636
+          h=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          assert h=='1ada53cceb4b364c16152e614ceca21a0c54423864cef4f42ed68650e5758db0',h
+          print('DERIVED_NORMALIZED_RECREATION_PASS',flush=True)
+          print('DERIVED_GENERATED_MANIFEST_SHA256_PASS',h,flush=True)
+          PY
+      - name: Package reproducible inputs and verify archive hashes
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee preservation-package.log
+          from pathlib import Path
+          import subprocess,json,hashlib,zipfile,datetime
+          root=Path('.').resolve()
+          harness=root.parent/'harness'
+          output=root/'micro-normalized-derived-inputs.zip'
+          source_paths=[Path(s.decode('utf-8')) for s in subprocess.check_output(['git','ls-files','-z'],cwd=root).split(b'\x00') if s]
+          assert 100 <= len(source_paths) <= 500,len(source_paths)
+          entries={}
+          for p in source_paths:
+              assert '..' not in p.parts and not p.is_absolute()
+              full=root/p
+              assert full.is_file(),p
+              entries['derived-upstream/'+p.as_posix()]=full.read_bytes()
+          for file in ('derive_micro_candidate.py','normalize_derived_multipliers.py','validate_derived_candidate.py'):
+              p=harness/'.github/scripts'/file
+              assert p.is_file(),p
+              entries['harness/.github/scripts/'+file]=p.read_bytes()
+          workflow=harness/'.github/workflows/upper-micro-normalized-full-integration.yml'
+          assert workflow.is_file()
+          entries['harness/.github/workflows/upper-micro-normalized-full-integration.yml']=workflow.read_bytes()
+          for name in ('micro-derived-input-report.json','micro-normalization-report.json','micro-numeric-preflight.json','micro-normalization-per-leaf.csv','derivation.log','normalization.log','numerics.log'):
+              entries['evidence/'+name]=(root/name).read_bytes()
+          generated=root/'MoserWorm/UpperBound/Certificate/Generated/manifest.json'
+          entries['evidence/derived-generated-manifest.json']=generated.read_bytes()
+          d=json.loads(entries['evidence/micro-derived-input-report.json'])
+          n=json.loads(entries['evidence/micro-normalization-report.json'])
+          readme='''# Normalized derived Upper source and certificate preservation
+          
+          Immutable upstream: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          Experiment harness: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          Proven result workflow: https://github.com/2300255-rgb/moser-worm-improved-bounds/actions/runs/40627299821
+          Shrink: delta2 = delta3 = 1/30000000
+          Exact improved area: 70988942955609283719006199/288183770260848000000000000
+          
+          `derived-upstream/` is the exact tracked source checkout after the experimental transformations,
+          including the normalized certificate multiplier gz files and the finite tree. It is not
+          an independent Lean toolchain or mathlib cache. `harness/` holds the scripts that made
+          this derived object. `evidence/derived-generated-manifest.json` fingerprints all the
+          reproducibly generated Lean sources; individual generated sources can be recreated
+          using `scripts/upper/export.py` and the tracked certificate.
+          
+          IMPORTANT: This snapshot is independently reconstructed from pinned inputs with the
+          same fingerprints. Lean itself was not run in this preservation workflow. For Lean
+          kernel proof evidence see original GitHub Actions run #40627299821.
+          '''
+          entries['README.md']=readme.encode()
+          hashes={k:{'sha256':hashlib.sha256(v).hexdigest(),'bytes':len(v)} for k,v in sorted(entries.items())}
+          index={'schema':1,'status':'RECONSTRUCTED_DERIVED_INPUTS_IDENTICAL_FINGERPRINTS',
+                'original_run_id':40627299821,'upstream_commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+                'harness_commit':'568c2f0ac41c60ff98c56b9da54aea9c56899bfc',
+                'derived_source_fingerprint':n['derived_source_fingerprint'],
+                'normalized_certificate_fingerprint':n['normalized_certificate_fingerprint'],
+                'derived_generated_manifest_sha256':hashes['evidence/derived-generated-manifest.json']['sha256'],
+                'source_file_count':len(source_paths),'files':hashes}
+          entries['ARCHIVE_INDEX.json']=(json.dumps(index,indent=2,sort_keys=True)+'\n').encode()
+          with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for name in sorted(entries):
+                  zi=zipfile.ZipInfo(name,date_time=(2026,10,28,0,0,0))
+                  zi.compress_type=zipfile.ZIP_DEFLATED
+                  zi.external_attr=0o644<<16
+                  z.writestr(zi,entries[name],compress_type=zipfile.ZIP_DEFLATED,compresslevel=6)
+          with zipfile.ZipFile(output) as z:
+              assert z.testzip() is None
+              received=json.loads(z.read('ARCHIVE_INDEX.json'))
+              assert len(received['files'])==len(z.namelist())-1
+              for name,rec in received['files'].items():
+                  data=z.read(name)
+                  assert len(data)==rec['bytes'] and hashlib.sha256(data).hexdigest()==rec['sha256'],name
+          digest=hashlib.sha256(output.read_bytes()).hexdigest()
+          (root/'micro-normalized-derived-inputs.sha256.txt').write_text(digest+'  '+output.name+'\n')
+          print('DERIVED_NORMALIZED_INPUT_ARCHIVE_INTEGRITY_PASS',len(source_paths),len(entries))
+          print('ARCHIVE_SHA256',digest)
+          print('ARCHIVE_BYTES',output.stat().st_size)
+          PY
+      - name: Upload preserved derived source and certificate
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: micro-normalized-derived-source-certificate
+          path: |
+            upstream/micro-normalized-derived-inputs.zip
+            upstream/micro-normalized-derived-inputs.sha256.txt
+            upstream/preservation-package.log
+          if-no-files-found: warn
+          retention-days: 30
