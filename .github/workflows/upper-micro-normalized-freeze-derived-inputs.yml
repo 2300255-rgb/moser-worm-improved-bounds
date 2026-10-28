@@ -80,7 +80,21 @@ jobs:
           harness=root.parent/'harness'
           output=root/'micro-normalized-derived-inputs.zip'
           source_paths=[Path(s.decode('utf-8')) for s in subprocess.check_output(['git','ls-files','-z'],cwd=root).split(b'\x00') if s]
-          assert 100 <= len(source_paths) <= 500,len(source_paths)
+          # The immutable upstream commit contains 1170 tracked files.
+          # The former cap of 500 incorrectly rejected a valid checkout.
+          assert len(source_paths) == 1170, f'Unexpected tracked file count: {len(source_paths)}'
+          tracked={p.as_posix() for p in source_paths}
+          required={
+              'certificates/upper/header.json',
+              'certificates/upper/manifest.json',
+              'certificates/upper/tree.json.gz',
+              'MoserWorm/UpperBound/Shape.lean',
+              'MoserWorm/UpperBound/Main.lean',
+              'scripts/upper/exact.py',
+          }
+          required.update(f'certificates/upper/multipliers-{i:03d}.jsonl.gz' for i in range(50))
+          assert required <= tracked, f'Missing required tracked inputs: {sorted(required-tracked)}'
+          print('PINNED_TRACKED_FILES_AND_50_MULTIPLIER_SHARDS_PASS',len(source_paths),flush=True)
           entries={}
           for p in source_paths:
               assert '..' not in p.parts and not p.is_absolute()
