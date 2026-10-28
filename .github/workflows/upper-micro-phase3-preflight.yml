@@ -1,0 +1,132 @@
+name: Upper micro candidate Phase 3 preflight (NOT full proof)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  micro-preflight:
+    name: Derive geometry and test Lean prerequisites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out experiment harness (current branch)
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable upstream source
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Verify original source and make derived (uncommitted) micro candidate
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json | tee phase3-derivation.log
+          echo '--- modified paths in disposable checkout ---'
+          git status --short | tee phase3-working-tree.txt
+          git diff -- MoserWorm/UpperBound/Certificate/Spec.lean \
+            MoserWorm/UpperBound/Shape.lean MoserWorm/MainTheorem.lean \
+            scripts/upper/exact.py certificates/upper/header.json \
+            certificates/upper/manifest.json > phase3-source-diff.patch
+      - name: Verify every unchanged leaf multiplier against derived exact rows
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ../harness/.github/scripts/validate_derived_candidate.py \
+            --root . --skip-export --report micro-numeric-preflight.json \
+            2>&1 | tee phase3-numerical.log
+      - name: Set up pinned Lean and Mathlib cache
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lean --version
+          lake exe cache get > phase3-mathlib-cache.log 2>&1
+      - name: Try compiling changed Shape and geometric soundness in Lean
+        working-directory: upstream
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          lake build MoserWorm.UpperBound.Certificate.Spec \
+            MoserWorm.UpperBound.Shape \
+            MoserWorm.UpperBound.Certificate.GeometricSound \
+            2>&1 | tee phase3-shape-geometric-lean.log
+          echo 'PHASE3_DERIVED_SHAPE_SOUNDNESS_COMPILE_PASS (not a universal-cover proof)'
+      - name: Export derived sources and kernel-check a limiting shard
+        working-directory: upstream
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee phase3-export.log
+          import sys
+          from pathlib import Path
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          from common import ROOT
+          cert=ROOT/'certificates/upper'
+          snapshot,header,_=inputs(cert)
+          assert header['complete'] is True
+          m=export(cert,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==snapshot and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          print('PHASE3_DERIVED_1636_SOURCES_EXPORTED',flush=True)
+          PY
+          lake build MoserWorm.UpperBound.Certificate.Generated.Shard511 \
+            MoserWorm.UpperBound.Certificate.Generated.Labels \
+            MoserWorm.UpperBound.Certificate.Generated.Orientations \
+            MoserWorm.UpperBound.Certificate.Generated.Rows0 \
+            2>&1 | tee phase3-sample-lean.log
+          echo 'PHASE3_LIMITING_LEAF_4093_IN_SHARD_511_AND_SAMPLES_PASS (not full proof)'
+      - name: Audit derived inputs did not change during test
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,sys
+          from pathlib import Path
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from exact import inputs
+          from common import source_snapshot
+          record=json.loads(Path('micro-derived-input-report.json').read_text())
+          assert source_snapshot()['sha256']==record['derived_source_fingerprint']
+          assert inputs(Path('certificates/upper'))[0]['sha256']==record['derived_certificate_fingerprint']
+          print('PHASE3_DERIVED_INPUTS_STABLE_PASS; FULL_UPPER_PROOF_NOT_RUN')
+          PY
+      - name: Save diagnostic evidence even on failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upper-micro-phase3-preflight-logs
+          path: |
+            upstream/phase3-*.log
+            upstream/phase3-*.txt
+            upstream/phase3-*.patch
+            upstream/micro-derived-input-report.json
+            upstream/micro-numeric-preflight.json
+          if-no-files-found: warn
+          retention-days: 30
