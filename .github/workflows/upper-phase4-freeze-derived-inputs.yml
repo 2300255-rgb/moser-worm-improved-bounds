@@ -1,0 +1,202 @@
+# Phase 4: preserve exact derived source & certificate for Lean PASS run 40745810520.
+# This archival workflow does not compile Lean and cannot itself establish a theorem.
+name: Phase 4 freeze exact adjusted source and certificate (audit only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  freeze-phase4:
+    name: Reproduce and preserve Phase 4 proof inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: upstream
+    steps:
+      - name: Check out immutable micro harness
+        uses: actions/checkout@v4
+        with:
+          ref: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable Phase 4 witness and derivation code
+        uses: actions/checkout@v4
+        with:
+          ref: be231de35e8be02500849785f32616eb001bbfca
+          path: research
+          persist-credentials: false
+      - name: Check out successful full integration workflow commit
+        uses: actions/checkout@v4
+        with:
+          ref: 5f09ca5c0f8aa7ad06ff2e3b5961ecf759305a25
+          path: proof-workflow
+          persist-credentials: false
+      - name: Check out immutable upstream source
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Recreate the exact Phase 4 source and certificate, and verify fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          test "$(git -C ../research rev-parse HEAD)" = 'be231de35e8be02500849785f32616eb001bbfca'
+          test "$(git -C ../proof-workflow rev-parse HEAD)" = '5f09ca5c0f8aa7ad06ff2e3b5961ecf759305a25'
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json > phase4-freeze-micro-derive.log 2>&1
+          python3 ../harness/.github/scripts/normalize_derived_multipliers.py \
+            --root . --derive-report micro-derived-input-report.json \
+            --report micro-normalization-report.json \
+            --csv micro-normalization-per-leaf.csv > phase4-freeze-normalize.log 2>&1
+          python3 ../research/.github/scripts/derive_phase4_from_normalized_micro.py \
+            --root . --witnesses ../research/.github/phase4/phase4_five_normalized_certificates.json \
+            --report phase4-derived-report.json > phase4-freeze-derive.log 2>&1
+          python3 - <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          from fractions import Fraction as Q
+          sys.path[:0] = [str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import ROOT,source_snapshot
+          from exact import inputs,H
+          from export import export
+          r=json.loads(Path('phase4-derived-report.json').read_text())
+          assert r['status']=='PHASE4_EXACT_DERIVED_INPUTS_NOT_LEAN_PROOF'
+          assert r['upstream_commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          assert r['delta2']==r['delta3']=='1/10000000'
+          assert r['area_exact']=='13146096881486542786561993/53367364863120000000000000'
+          assert r['leaves']==12663 and r['all_LB_equal_1'] is True
+          assert r['five_modified_Geometry_valid'] is True
+          assert r['reoptimized_leaves']==[2056,4093,7875,9312,11786]
+          assert r['certificate_files_updated']==50
+          assert source_snapshot()['sha256']==r['source_fingerprint']=='24369c3b0e4ce582a64a28891d923de11cbad91ee7603064c4ea6186d4a897a8'
+          cert,header,meta=inputs(ROOT/'certificates/upper')
+          assert cert['sha256']==r['certificate_fingerprint']=='c2650647317eaee181d53e447acd3e0f5f86f39a48d1f07fd40c6d6b800de594'
+          assert header['complete'] is True and header['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(1,10000000),Q('446199/1000000')-Q(1,10000000)]
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=export(ROOT/'certificates/upper',out)
+          assert m['complete'] and m['shards']==1583 and len(m['modules'])==1636
+          assert m['inputs']==cert
+          sha=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          assert sha=='9c727d3685b9ec6ad38c648ada609251ebf7df2c3bdb6bbb155342a2026218bf',sha
+          print('PHASE4_FREEZE_EXACT_FINGERPRINTS_AND_GENERATED_MANIFEST_PASS',flush=True)
+          print('PHASE4_FREEZE_NO_LEAN_RECOMPILATION_PERFORMED',flush=True)
+          PY
+      - name: Archive reproducible Phase 4 inputs and verify every ZIP entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee phase4-freeze-packaging.log
+          from pathlib import Path
+          import subprocess,hashlib,json,zipfile
+          root=Path.cwd(); base=root.parent
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          tracked=[Path(x.decode('utf8')) for x in subprocess.check_output(['git','ls-files','-z'],cwd=root).split(b'\0') if x]
+          # The pinned upstream checkout has 1170 tracked files. Do not cap it at 500.
+          assert len(tracked)==1170,('unexpected pinned tracked file count',len(tracked))
+          names={p.as_posix() for p in tracked}
+          required={'certificates/upper/header.json','certificates/upper/manifest.json',
+                    'certificates/upper/tree.json.gz','MoserWorm/UpperBound/Shape.lean',
+                    'MoserWorm/UpperBound/Main.lean','scripts/upper/exact.py'}
+          required|={f'certificates/upper/multipliers-{i:03d}.jsonl.gz' for i in range(50)}
+          assert required<=names,sorted(required-names)
+          entries={}
+          for p in tracked:
+              assert not p.is_absolute() and '..' not in p.parts
+              assert (root/p).is_file(),p
+              entries['derived-upstream/'+p.as_posix()]=(root/p).read_bytes()
+          files={
+            'harness/.github/scripts/derive_micro_candidate.py':base/'harness/.github/scripts/derive_micro_candidate.py',
+            'harness/.github/scripts/normalize_derived_multipliers.py':base/'harness/.github/scripts/normalize_derived_multipliers.py',
+            'research/.github/scripts/derive_phase4_from_normalized_micro.py':base/'research/.github/scripts/derive_phase4_from_normalized_micro.py',
+            'research/.github/phase4/phase4_five_normalized_certificates.json':base/'research/.github/phase4/phase4_five_normalized_certificates.json',
+            'workflows/upper-phase4-adjusted-full-integration.yml':base/'proof-workflow/.github/workflows/upper-phase4-adjusted-full-integration.yml',
+          }
+          for archive_path,p in files.items():
+              assert p.is_file(),p
+              entries[archive_path]=p.read_bytes()
+          extra=['micro-derived-input-report.json','micro-normalization-report.json',
+                 'micro-normalization-per-leaf.csv','phase4-derived-report.json',
+                 'phase4-freeze-micro-derive.log','phase4-freeze-normalize.log',
+                 'phase4-freeze-derive.log']
+          for name in extra:entries['evidence/'+name]=(root/name).read_bytes()
+          entries['evidence/generated-manifest.json']=(root/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()
+          report=json.loads(entries['evidence/phase4-derived-report.json'])
+          assert report['source_fingerprint']=='24369c3b0e4ce582a64a28891d923de11cbad91ee7603064c4ea6186d4a897a8'
+          assert report['certificate_fingerprint']=='c2650647317eaee181d53e447acd3e0f5f86f39a48d1f07fd40c6d6b800de594'
+          entries['README.md']=(
+            '# Phase 4 exact derived source and certificate\n\n'
+            'This is an input-preservation archive, NOT a Lean proof rerun.\n'
+            'Full successful GitHub Actions run: https://github.com/2300255-rgb/moser-worm-improved-bounds/actions/runs/40745810520\n'
+            'Immutable upstream: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4\n'
+            'Micro harness: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc\n'
+            'Phase 4 research: be231de35e8be02500849785f32616eb001bbfca\n'
+            'Proof workflow: 5f09ca5c0f8aa7ad06ff2e3b5961ecf759305a25\n'
+            'delta2 = delta3 = 1/10000000\n'
+            'Exact area: 13146096881486542786561993/53367364863120000000000000\n'
+            'Use the stored 4 shard .olean ZIP files and final evidence ZIP for Lean run logs.\n'
+            'Generated Lean modules are reproducible from the tracked derived source and certificate.\n'
+          ).encode('utf8')
+          table={name:{'sha256':sha(data),'bytes':len(data)} for name,data in sorted(entries.items())}
+          index={'schema':1,'status':'PHASE4_RECONSTRUCTED_INPUTS_IDENTICAL_FINGERPRINTS',
+                 'original_proof_run_id':40745810520,
+                 'upstream_commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+                 'harness_commit':'568c2f0ac41c60ff98c56b9da54aea9c56899bfc',
+                 'research_commit':'be231de35e8be02500849785f32616eb001bbfca',
+                 'proof_workflow_commit':'5f09ca5c0f8aa7ad06ff2e3b5961ecf759305a25',
+                 'source_fingerprint':report['source_fingerprint'],
+                 'certificate_fingerprint':report['certificate_fingerprint'],
+                 'manifest_sha256':sha(entries['evidence/generated-manifest.json']),
+                 'source_file_count':len(tracked),'files':table}
+          entries['ARCHIVE_INDEX.json']=(json.dumps(index,indent=2,sort_keys=True)+'\n').encode()
+          archive=root/'phase4-adjusted-derived-inputs.zip'
+          with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for name,data in sorted(entries.items()):
+                  zi=zipfile.ZipInfo(name,date_time=(2026,10,29,0,0,0))
+                  zi.compress_type=zipfile.ZIP_DEFLATED
+                  zi.external_attr=0o644<<16
+                  z.writestr(zi,data,compress_type=zipfile.ZIP_DEFLATED,compresslevel=6)
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None
+              got=json.loads(z.read('ARCHIVE_INDEX.json'))
+              assert len(got['files'])==len(z.namelist())-1
+              for name,rec in got['files'].items():
+                  b=z.read(name)
+                  assert len(b)==rec['bytes'] and sha(b)==rec['sha256'],name
+          digest=sha(archive.read_bytes())
+          (root/'phase4-adjusted-derived-inputs.sha256.txt').write_text(digest+'  '+archive.name+'\n')
+          print('PHASE4_DERIVED_INPUT_ARCHIVE_INTEGRITY_PASS',len(tracked),len(entries),flush=True)
+          print('PHASE4_ARCHIVE_SHA256',digest,flush=True)
+          print('PHASE4_ARCHIVE_BYTES',archive.stat().st_size,flush=True)
+          PY
+      - name: Upload exact Phase 4 derived source and certificate
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: phase4-adjusted-derived-source-certificate
+          path: |
+            upstream/phase4-adjusted-derived-inputs.zip
+            upstream/phase4-adjusted-derived-inputs.sha256.txt
+            upstream/phase4-freeze-packaging.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve failure diagnostics if needed
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: phase4-adjusted-input-freeze-diagnostics
+          path: |
+            upstream/phase4-freeze-*.log
+            upstream/phase4-derived-report.json
+            upstream/micro-derived-input-report.json
+            upstream/micro-normalization-report.json
+          if-no-files-found: warn
+          retention-days: 14
