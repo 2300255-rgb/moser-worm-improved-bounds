@@ -1,0 +1,584 @@
+# RESEARCH EXPERIMENT: Phase 4B delta=7/50000000; 5-shard preflight succeeded; full proof not yet run.
+# Inputs pinned to upstream, successful micro harness, and successful Phase 4 and Phase 4B preflight commits.
+# No source or theorem is weakened; derived certificate normalization is audited.
+# Actual Lean PASS requires all four jobs AND final to succeed.
+name: Phase 4B stronger-cover complete Upper Lean integration (experimental)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shards:
+    name: Phase 4B verify shard group ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    defaults:
+      run:
+        working-directory: upstream
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [0, 1, 2, 3]
+    steps:
+      - name: Check out immutable micro proof harness
+        uses: actions/checkout@v4
+        with:
+          ref: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable Phase 4 preflight inputs
+        uses: actions/checkout@v4
+        with:
+          ref: be231de35e8be02500849785f32616eb001bbfca
+          path: research
+          persist-credentials: false
+      - name: Check out immutable successful Phase 4B five-shard inputs
+        uses: actions/checkout@v4
+        with:
+          ref: 2d2dca1605a569491b3c5b2229828a4412458e33
+          path: phase4b
+          persist-credentials: false
+      - name: Check out immutable original upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Recreate and audit exact Phase 4 candidate (no theorem claim)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          test "$(git -C ../research rev-parse HEAD)" = 'be231de35e8be02500849785f32616eb001bbfca'
+          test -f ../research/.github/scripts/derive_phase4_from_normalized_micro.py
+          test -f ../research/.github/phase4/phase4_five_normalized_certificates.json
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json > derive.log 2>&1
+          python3 ../harness/.github/scripts/normalize_derived_multipliers.py \
+            --root . --derive-report micro-derived-input-report.json \
+            --report micro-normalization-report.json \
+            --csv micro-normalization-per-leaf.csv > normalize.log 2>&1
+          # The micro-only numeric check here certifies the starting point, NOT Phase 4.
+          python3 ../harness/.github/scripts/validate_derived_candidate.py \
+            --root . --skip-export --report micro-numeric-preflight.json > numeric-micro.log 2>&1
+          python3 ../research/.github/scripts/derive_phase4_from_normalized_micro.py \
+            --root . \
+            --witnesses ../research/.github/phase4/phase4_five_normalized_certificates.json \
+            --report phase4-derived-report.json > derive-phase4.log 2>&1
+          python3 - <<'PY_CHECK'
+          import json,sys,hashlib
+          from pathlib import Path
+          from fractions import Fraction as Q
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import source_snapshot
+          from exact import inputs,H
+          d=json.loads(Path('micro-derived-input-report.json').read_text())
+          n=json.loads(Path('micro-normalization-report.json').read_text())
+          q=json.loads(Path('micro-numeric-preflight.json').read_text())
+          p=json.loads(Path('phase4-derived-report.json').read_text())
+          assert d['delta2']==d['delta3']=='1/30000000'
+          assert n['number_of_leaves']==12663 and n['normalized_all_LB_equal_1'] is True
+          assert q['number_of_leaves']==12663 and q['numerically_failed_leaves']==0
+          assert n['derived_source_fingerprint']==q['source_fingerprint']
+          assert n['normalized_certificate_fingerprint']==q['certificate_fingerprint']
+          assert p['original_micro_source_fingerprint']==n['derived_source_fingerprint']
+          assert p['original_micro_certificate_fingerprint']==n['normalized_certificate_fingerprint']
+          assert p['status']=='PHASE4_EXACT_DERIVED_INPUTS_NOT_LEAN_PROOF'
+          assert p['upstream_commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          assert p['delta2']==p['delta3']=='1/10000000'
+          assert p['leaves']==12663 and p['all_LB_equal_1'] is True
+          assert p['five_modified_Geometry_valid'] is True
+          assert p['reoptimized_leaves']==[2056,4093,7875,9312,11786]
+          assert p['certificate_files_updated']==50
+          assert p['area_exact']=='13146096881486542786561993/53367364863120000000000000'
+          assert source_snapshot()['sha256']==p['source_fingerprint']=='24369c3b0e4ce582a64a28891d923de11cbad91ee7603064c4ea6186d4a897a8'
+          inp,h,_=inputs(Path('certificates/upper'))
+          assert inp['sha256']==p['certificate_fingerprint']=='c2650647317eaee181d53e447acd3e0f5f86f39a48d1f07fd40c6d6b800de594'
+          assert h['complete'] is True and h['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(1,10000000),Q('446199/1000000')-Q(1,10000000)]
+          print('PHASE4_EXACT_INPUTS_AND_REOPTIMIZED_FIVE_PASS; NOT_A_LEAN_PROOF',flush=True)
+          PY_CHECK
+      - name: Restore five rational witnesses and derive Phase 4B exact inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../phase4b rev-parse HEAD)" = '2d2dca1605a569491b3c5b2229828a4412458e33'
+          base64 -d ../phase4b/.github/phase4b/five_leaf_integer_rational_witnesses.json.gz.b64 > phase4b-five-witnesses.json.gz
+          test "$(sha256sum phase4b-five-witnesses.json.gz | cut -d' ' -f1)" = '6d221790384819fa59785c703a05d9b92edaab979d7ef8b71be599a42ba36ecd'
+          python3 ../phase4b/.github/scripts/derive_phase4b_from_phase4.py \
+            --root . --witnesses phase4b-five-witnesses.json.gz \
+            --report phase4b-derived-report.json 2>&1 | tee phase4b-derive.log
+      - name: Audit exact new inputs and archived geometric witnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../phase4b rev-parse HEAD)" = '2d2dca1605a569491b3c5b2229828a4412458e33'
+          python3 - <<'PY' 2>&1 | tee phase4b-input-audit.log
+          import hashlib,json,sys
+          from pathlib import Path
+          from fractions import Fraction as Q
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import source_snapshot
+          from exact import inputs,H
+          r=json.loads(Path('phase4b-derived-report.json').read_text())
+          assert r['status']=='PHASE4B_DERIVED_EXACT_INPUTS_NOT_YET_LEAN_PROOF'
+          assert r['delta2']==r['delta3']=='7/50000000'
+          assert r['additional_shift']=='1/25000000'
+          assert r['area_exact']=='985957101148325639719241171/4002552364734000000000000000'
+          assert r['leaves']==12663 and r['all_LB_equal_1'] is True
+          assert r['changed_leaves']==[2056,4093,7875,9312,11786]
+          assert r['changed_leaf_geometry_valid_exact'] is True
+          assert r['changed_leaf_rows']==2990 and r['normalized_certificate_files_updated']==50
+          assert source_snapshot()['sha256']==r['source_fingerprint']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          cert,header,_=inputs(Path('certificates/upper'))
+          assert cert['sha256']==r['certificate_fingerprint']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          assert header['complete'] is True and header['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(7,50000000),Q('446199/1000000')-Q(7,50000000)]
+          print('PHASE4B_DERIVED_INPUTS_EXACT_FINGERPRINTS_PASS',flush=True)
+          PY
+      - name: Set up pinned Lean and mathlib
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          test "$(git -C ../research rev-parse HEAD)" = 'be231de35e8be02500849785f32616eb001bbfca'
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Export and verify assigned shards, preserving olean files
+        shell: bash
+        env:
+          GROUP: ${{ matrix.group }}
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee shard-progress.log
+          import sys,os,json,hashlib,subprocess,time
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          group=int(os.environ['GROUP']); assert group in range(4)
+          src=source_snapshot(); cert=ROOT/'certificates/upper'
+          inp,h,_=inputs(cert); assert h['complete'] is True
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=export(cert,out)
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          ns='MoserWorm.UpperBound.Certificate.Generated.Shard'
+          names=[ns+str(i) for i in range(1583) if i%4==group]
+          actual={x['name'] for x in m['modules']}
+          assert set(names)<=actual
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          base.mkdir(parents=True,exist_ok=True)
+          p=json.loads(Path('phase4b-derived-report.json').read_text())
+          manifest_sha=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          assert manifest_sha=='e9e22c2ca8bd9660b78ed8174af5f46cb93f1c3372d5d0e45e759bc5c4678e75'
+          assert src['sha256']==p['source_fingerprint']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          assert inp['sha256']==p['certificate_fingerprint']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          assert p['status']=='PHASE4B_DERIVED_EXACT_INPUTS_NOT_YET_LEAN_PROOF'
+          assert p['leaves']==12663 and p['all_LB_equal_1'] is True
+          assert p['changed_leaves']==[2056,4093,7875,9312,11786]
+          assert p['changed_leaf_rows']==2990 and p['normalized_certificate_files_updated']==50
+          assert p['area_exact']=='985957101148325639719241171/4002552364734000000000000000'
+          assert p['changed_leaf_geometry_valid_exact'] is True
+          assert p['delta2']==p['delta3']=='7/50000000'
+          rec={'group':group,'source':src['sha256'],'inputs':inp['sha256'],
+               'manifest':manifest_sha,
+               'commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+               'harness_commit':'568c2f0ac41c60ff98c56b9da54aea9c56899bfc',
+               'research_commit':'be231de35e8be02500849785f32616eb001bbfca',
+               'phase4b_commit':'2d2dca1605a569491b3c5b2229828a4412458e33',
+               'delta2':p['delta2'],'delta3':p['delta3'],
+               'exact_area':p['area_exact'],
+               'all_LB_equal_1':p['all_LB_equal_1'],
+               'reoptimized_leaves':p['changed_leaves'],
+               'number_of_leaves':p['leaves'],
+               'expected':names,'verified':[],'hashes':{},'complete':False}
+          dest=Path('group-record.json')
+          def save():dest.write_text(json.dumps(rec,sort_keys=True,indent=2)+'\n')
+          save()
+          # Build common prerequisites once, then compile assigned shards directly.
+          subprocess.run(['lake','build','MoserWorm.UpperBound.Certificate.Kernel.Header'],check=True,
+                         stdout=open('shared-build.log','w'),stderr=subprocess.STDOUT)
+          for mod in ('Data','Tries'):
+              subprocess.run(['lake','env','lean','-o',str(base/(mod+'.olean')),str(out/(mod+'.lean'))],check=True,
+                             stdout=open('common-direct.log','a'),stderr=subprocess.STDOUT)
+          for j,name in enumerate(names,1):
+              short=name.rsplit('.',1)[-1]; output=base/(short+'.olean')
+              print('BEGIN_SHARD',short,flush=True)
+              with open('last-shard.log','w') as log:
+                  subprocess.run(['lake','env','lean','-o',str(output),str(out/(short+'.lean'))],
+                                 stdout=log,stderr=subprocess.STDOUT,check=True)
+              assert output.is_file() and output.stat().st_size>0
+              rec['hashes'][short]=hashlib.sha256(output.read_bytes()).hexdigest()
+              rec['verified'].append(name)
+              if j%10==0 or j==len(names):
+                  save(); print('GROUP',group,j,'/',len(names),flush=True)
+          assert source_snapshot()==src and inputs(cert)[0]==inp
+          rec['complete']=True; save()
+          print('PHASE4B_GROUP_OLEAN_PASS',group,len(names),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase4b-adjusted-shard-oleans-${{ matrix.group }}
+          path: |
+            upstream/.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Shard*.olean
+            upstream/group-record.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 21
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase4b-adjusted-shard-logs-${{ matrix.group }}
+          path: |
+            upstream/shard-progress.log
+            upstream/shared-build.log
+            upstream/common-direct.log
+            upstream/last-shard.log
+            upstream/derive.log
+            upstream/normalize.log
+            upstream/derive-phase4.log
+            upstream/phase4-derived-report.json
+            upstream/phase4b-derive.log
+            upstream/phase4b-derived-report.json
+            upstream/numeric-micro.log
+            upstream/micro-derived-input-report.json
+            upstream/micro-normalization-report.json
+            upstream/micro-numeric-preflight.json
+          if-no-files-found: warn
+          retention-days: 21
+  final:
+    name: Phase 4B audit all shards and compile Upper Main
+    needs: shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    defaults:
+      run:
+        working-directory: upstream
+    steps:
+      - name: Check out immutable micro proof harness
+        uses: actions/checkout@v4
+        with:
+          ref: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable Phase 4 preflight inputs
+        uses: actions/checkout@v4
+        with:
+          ref: be231de35e8be02500849785f32616eb001bbfca
+          path: research
+          persist-credentials: false
+      - name: Check out immutable successful Phase 4B five-shard inputs
+        uses: actions/checkout@v4
+        with:
+          ref: 2d2dca1605a569491b3c5b2229828a4412458e33
+          path: phase4b
+          persist-credentials: false
+      - name: Check out immutable original upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Recreate and audit exact Phase 4 candidate (no theorem claim)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          test "$(git -C ../research rev-parse HEAD)" = 'be231de35e8be02500849785f32616eb001bbfca'
+          test -f ../research/.github/scripts/derive_phase4_from_normalized_micro.py
+          test -f ../research/.github/phase4/phase4_five_normalized_certificates.json
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json > derive.log 2>&1
+          python3 ../harness/.github/scripts/normalize_derived_multipliers.py \
+            --root . --derive-report micro-derived-input-report.json \
+            --report micro-normalization-report.json \
+            --csv micro-normalization-per-leaf.csv > normalize.log 2>&1
+          # The micro-only numeric check here certifies the starting point, NOT Phase 4.
+          python3 ../harness/.github/scripts/validate_derived_candidate.py \
+            --root . --skip-export --report micro-numeric-preflight.json > numeric-micro.log 2>&1
+          python3 ../research/.github/scripts/derive_phase4_from_normalized_micro.py \
+            --root . \
+            --witnesses ../research/.github/phase4/phase4_five_normalized_certificates.json \
+            --report phase4-derived-report.json > derive-phase4.log 2>&1
+          python3 - <<'PY_CHECK'
+          import json,sys,hashlib
+          from pathlib import Path
+          from fractions import Fraction as Q
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import source_snapshot
+          from exact import inputs,H
+          d=json.loads(Path('micro-derived-input-report.json').read_text())
+          n=json.loads(Path('micro-normalization-report.json').read_text())
+          q=json.loads(Path('micro-numeric-preflight.json').read_text())
+          p=json.loads(Path('phase4-derived-report.json').read_text())
+          assert d['delta2']==d['delta3']=='1/30000000'
+          assert n['number_of_leaves']==12663 and n['normalized_all_LB_equal_1'] is True
+          assert q['number_of_leaves']==12663 and q['numerically_failed_leaves']==0
+          assert n['derived_source_fingerprint']==q['source_fingerprint']
+          assert n['normalized_certificate_fingerprint']==q['certificate_fingerprint']
+          assert p['original_micro_source_fingerprint']==n['derived_source_fingerprint']
+          assert p['original_micro_certificate_fingerprint']==n['normalized_certificate_fingerprint']
+          assert p['status']=='PHASE4_EXACT_DERIVED_INPUTS_NOT_LEAN_PROOF'
+          assert p['upstream_commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+          assert p['delta2']==p['delta3']=='1/10000000'
+          assert p['leaves']==12663 and p['all_LB_equal_1'] is True
+          assert p['five_modified_Geometry_valid'] is True
+          assert p['reoptimized_leaves']==[2056,4093,7875,9312,11786]
+          assert p['certificate_files_updated']==50
+          assert p['area_exact']=='13146096881486542786561993/53367364863120000000000000'
+          assert source_snapshot()['sha256']==p['source_fingerprint']=='24369c3b0e4ce582a64a28891d923de11cbad91ee7603064c4ea6186d4a897a8'
+          inp,h,_=inputs(Path('certificates/upper'))
+          assert inp['sha256']==p['certificate_fingerprint']=='c2650647317eaee181d53e447acd3e0f5f86f39a48d1f07fd40c6d6b800de594'
+          assert h['complete'] is True and h['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(1,10000000),Q('446199/1000000')-Q(1,10000000)]
+          print('PHASE4_EXACT_INPUTS_AND_REOPTIMIZED_FIVE_PASS; NOT_A_LEAN_PROOF',flush=True)
+          PY_CHECK
+      - name: Restore five rational witnesses and derive Phase 4B exact inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../phase4b rev-parse HEAD)" = '2d2dca1605a569491b3c5b2229828a4412458e33'
+          base64 -d ../phase4b/.github/phase4b/five_leaf_integer_rational_witnesses.json.gz.b64 > phase4b-five-witnesses.json.gz
+          test "$(sha256sum phase4b-five-witnesses.json.gz | cut -d' ' -f1)" = '6d221790384819fa59785c703a05d9b92edaab979d7ef8b71be599a42ba36ecd'
+          python3 ../phase4b/.github/scripts/derive_phase4b_from_phase4.py \
+            --root . --witnesses phase4b-five-witnesses.json.gz \
+            --report phase4b-derived-report.json 2>&1 | tee phase4b-derive.log
+      - name: Audit exact new inputs and archived geometric witnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../phase4b rev-parse HEAD)" = '2d2dca1605a569491b3c5b2229828a4412458e33'
+          python3 - <<'PY' 2>&1 | tee phase4b-input-audit.log
+          import hashlib,json,sys
+          from pathlib import Path
+          from fractions import Fraction as Q
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import source_snapshot
+          from exact import inputs,H
+          r=json.loads(Path('phase4b-derived-report.json').read_text())
+          assert r['status']=='PHASE4B_DERIVED_EXACT_INPUTS_NOT_YET_LEAN_PROOF'
+          assert r['delta2']==r['delta3']=='7/50000000'
+          assert r['additional_shift']=='1/25000000'
+          assert r['area_exact']=='985957101148325639719241171/4002552364734000000000000000'
+          assert r['leaves']==12663 and r['all_LB_equal_1'] is True
+          assert r['changed_leaves']==[2056,4093,7875,9312,11786]
+          assert r['changed_leaf_geometry_valid_exact'] is True
+          assert r['changed_leaf_rows']==2990 and r['normalized_certificate_files_updated']==50
+          assert source_snapshot()['sha256']==r['source_fingerprint']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          cert,header,_=inputs(Path('certificates/upper'))
+          assert cert['sha256']==r['certificate_fingerprint']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          assert header['complete'] is True and header['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(7,50000000),Q('446199/1000000')-Q(7,50000000)]
+          print('PHASE4B_DERIVED_INPUTS_EXACT_FINGERPRINTS_PASS',flush=True)
+          PY
+      - name: Set up pinned Lean and mathlib
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          test "$(git -C ../harness rev-parse HEAD)" = '568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+          test "$(git -C ../research rev-parse HEAD)" = 'be231de35e8be02500849785f32616eb001bbfca'
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:v4.33.1
+          lake exe cache get > mathlib-cache.log 2>&1
+      - name: Re-export sources and build shared soundness dependencies
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT
+          from exact import inputs
+          from export import export,SHARD_SIZE
+          c=ROOT/'certificates/upper'; inp,h,_=inputs(c)
+          assert h['complete'] is True
+          m=export(c,ROOT/'MoserWorm/UpperBound/Certificate/Generated')
+          assert m['complete'] is True and m['inputs']==inp and m['shard_size']==SHARD_SIZE
+          assert m['shards']==1583 and len(m['modules'])==1636
+          import hashlib
+          digest=hashlib.sha256((ROOT/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()).hexdigest()
+          assert digest=='e9e22c2ca8bd9660b78ed8174af5f46cb93f1c3372d5d0e45e759bc5c4678e75',digest
+          print('PHASE4B_MANIFEST_SHA256_PASS',digest,flush=True)
+          PY
+          lake build MoserWorm.UpperBound.Certificate.Kernel.Header MoserWorm.UpperBound.Certificate.Extraction MoserWorm.UpperBound.Certificate.GeometricSound > soundness-build.log 2>&1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phase4b-adjusted-shard-oleans-*
+          path: upstream/received
+          merge-multiple: false
+      - name: Audit all 1583 transferred olean files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee transfer-audit.log
+          import json,hashlib,shutil,sys
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          base.mkdir(parents=True,exist_ok=True)
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          source=source_snapshot()['sha256']; inp=inputs(ROOT/'certificates/upper')[0]['sha256']
+          manifest=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          all_names=[]
+          for g in range(4):
+              folder=Path(f'received/phase4b-adjusted-shard-oleans-{g}')
+              rec=json.loads((folder/'group-record.json').read_text())
+              assert rec['complete'] and rec['group']==g
+              assert (rec['source'],rec['inputs'],rec['manifest'])==(source,inp,manifest)
+              assert rec['commit']=='9a3394130fe4f7b1df6ffdeffda16601795d9ce4'
+              assert rec['harness_commit']=='568c2f0ac41c60ff98c56b9da54aea9c56899bfc'
+              assert rec['research_commit']=='be231de35e8be02500849785f32616eb001bbfca'
+              assert rec['phase4b_commit']=='2d2dca1605a569491b3c5b2229828a4412458e33'
+              assert rec['delta2']==rec['delta3']=='7/50000000'
+              assert rec['all_LB_equal_1'] is True and rec['number_of_leaves']==12663
+              assert rec['reoptimized_leaves']==[2056,4093,7875,9312,11786]
+              assert rec['exact_area']==json.loads(Path('phase4b-derived-report.json').read_text())['area_exact']
+              expected=['MoserWorm.UpperBound.Certificate.Generated.Shard'+str(i) for i in range(1583) if i%4==g]
+              assert rec['expected']==rec['verified']==expected
+              assert set(rec['hashes'])=={'Shard'+str(i) for i in range(1583) if i%4==g}
+              for name,sha in rec['hashes'].items():
+                  src=folder/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'/(name+'.olean')
+                  assert src.is_file(),f'missing {src}'
+                  assert hashlib.sha256(src.read_bytes()).hexdigest()==sha,f'hash mismatch {name}'
+                  assert not (base/(name+'.olean')).exists(),f'duplicate {name}'
+                  shutil.copy2(src,base/(name+'.olean'))
+                  all_names.append(name)
+              print('TRANSFER GROUP PASS',g,len(rec['hashes']),flush=True)
+          assert set(all_names)=={'Shard'+str(i) for i in range(1583)} and len(all_names)==1583
+          Path('transfer-audit.json').write_text(json.dumps({
+              'source':source,'inputs':inp,'manifest':manifest,
+              'harness_commit':'568c2f0ac41c60ff98c56b9da54aea9c56899bfc',
+              'research_commit':'be231de35e8be02500849785f32616eb001bbfca',
+              'phase4b_commit':'2d2dca1605a569491b3c5b2229828a4412458e33',
+              'upstream_commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+              'delta2':'7/50000000','delta3':'7/50000000',
+              'exact_area':json.loads(Path('phase4b-derived-report.json').read_text())['area_exact'],
+              'shards':1583,'verified':True},indent=2))
+          print('PHASE4B_ALL_1583_OLEAN_TRANSFER_SHA256_PASS',flush=True)
+          PY
+      - name: Compile remaining generated modules and final Main with direct Lean
+        shell: bash
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee final-progress.log
+          import json,subprocess,sys,time
+          from pathlib import Path
+          sys.path.insert(0,str(Path('scripts').resolve()))
+          sys.path.insert(0,str(Path('scripts/upper').resolve()))
+          from common import ROOT,source_snapshot
+          from exact import inputs
+          from graphlib import TopologicalSorter
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=json.loads((out/'manifest.json').read_text())
+          source_before=source_snapshot(); input_before=inputs(ROOT/'certificates/upper')[0]
+          graph={x['name']:set(x['dependencies']) for x in m['modules']}
+          order=list(TopologicalSorter(graph).static_order())
+          base=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated'
+          def compile(path,output,label):
+              print('BEGIN',label,flush=True)
+              start=time.monotonic()
+              with open('last-final-lean.log','w') as log:
+                  subprocess.run(['lake','env','lean','-o',str(output),str(path)],check=True,
+                                 stdout=log,stderr=subprocess.STDOUT)
+              assert output.is_file() and output.stat().st_size>0
+              print('PASS',label,'seconds',round(time.monotonic()-start,2),flush=True)
+          for name in order:
+              short=name.rsplit('.',1)[-1]
+              if short.startswith('Shard') and short[5:].isdigit():
+                  assert (base/(short+'.olean')).is_file()
+                  continue
+              compile(out/(short+'.lean'),base/(short+'.olean'),short)
+          # Main imports Assembly, Common.Audit and GeometricSound.
+          # Build Common.Audit explicitly without asking Lake to build Assembly.
+          subprocess.run(['lake','build','MoserWorm.Common.Audit'],check=True,
+                         stdout=open('audit-deps.log','w'),stderr=subprocess.STDOUT)
+          main=ROOT/'MoserWorm/UpperBound/Main.lean'
+          source_text=main.read_text()
+          assert 'audit_axioms MoserWorm.upper_bound MoserWorm.optimalArea_upper_bound' in source_text
+          assert 'theorem upper_bound' in source_text and 'theorem optimalArea_upper_bound' in source_text
+          main_output=ROOT/'.lake/build/lib/lean/MoserWorm/UpperBound/Main.olean'
+          compile(main,main_output,'Main')
+          assert source_snapshot()==source_before and inputs(ROOT/'certificates/upper')[0]==input_before
+          import hashlib,os
+          def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          other_names=[name for name in order if not (name.rsplit('.',1)[-1].startswith('Shard') and name.rsplit('.',1)[-1][5:].isdigit())]
+          assert len(other_names)==53 and all((base/(n.rsplit('.',1)[-1]+'.olean')).is_file() for n in other_names)
+          phase4b=json.loads(Path('phase4b-derived-report.json').read_text())
+          assert phase4b['area_exact']=='985957101148325639719241171/4002552364734000000000000000'
+          assert source_before['sha256']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          assert input_before['sha256']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          assert sha(out/'manifest.json')=='e9e22c2ca8bd9660b78ed8174af5f46cb93f1c3372d5d0e45e759bc5c4678e75'
+          evidence={'status':'PHASE4B_UPPER_MAIN_DIRECT_LEAN_PASS',
+              'full_original_verify_py_executed':False,
+              'upstream_commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+              'harness_commit':'568c2f0ac41c60ff98c56b9da54aea9c56899bfc',
+              'research_commit':'be231de35e8be02500849785f32616eb001bbfca',
+              'phase4b_commit':'2d2dca1605a569491b3c5b2229828a4412458e33',
+              'delta2':'7/50000000','delta3':'7/50000000',
+              'exact_area':'985957101148325639719241171/4002552364734000000000000000',
+              'reoptimized_leaves':[2056,4093,7875,9312,11786],
+              'derived_source_fingerprint':source_before['sha256'],
+              'normalized_certificate_fingerprint':input_before['sha256'],
+              'manifest_sha256':sha(out/'manifest.json'),
+              'main_olean_sha256':sha(main_output),
+              'other_53_olean_sha256':{n:sha(base/(n.rsplit('.',1)[-1]+'.olean')) for n in other_names}}
+          Path('final-evidence.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+          print('PHASE4B_UPPER_MAIN_LEAN_AND_AXIOM_AUDIT_PASS; UPSTREAM_VERIFY_PY_NOT_RUN',flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase4b-adjusted-final-integration-logs
+          path: |
+            upstream/mathlib-cache.log
+            upstream/soundness-build.log
+            upstream/transfer-audit.log
+            upstream/transfer-audit.json
+            upstream/final-progress.log
+            upstream/last-final-lean.log
+            upstream/audit-deps.log
+            upstream/derive.log
+            upstream/normalize.log
+            upstream/derive-phase4.log
+            upstream/phase4-derived-report.json
+            upstream/phase4b-derive.log
+            upstream/phase4b-derived-report.json
+            upstream/numeric-micro.log
+            upstream/micro-derived-input-report.json
+            upstream/micro-normalization-report.json
+            upstream/micro-numeric-preflight.json
+            upstream/final-evidence.json
+            upstream/.lake/build/lib/lean/MoserWorm/UpperBound/Main.olean
+            upstream/.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Tree.olean
+            upstream/.lake/build/lib/lean/MoserWorm/UpperBound/Certificate/Generated/Assembly.olean
+            upstream/MoserWorm/UpperBound/Certificate/Generated/manifest.json
+          if-no-files-found: warn
+          retention-days: 21
