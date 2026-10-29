@@ -1,0 +1,207 @@
+# Preservation-only action. Does not rerun Lean or assert independent peer review.
+# Reconstructs the exact inputs of the 2026-10-29 Phase 4B Lean PASS.
+name: Phase 4B freeze exact derived Upper inputs (audit only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  freeze:
+    name: Recreate and archive exact Phase 4B source and certificates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: upstream
+    steps:
+      - name: Check out immutable micro harness
+        uses: actions/checkout@v4
+        with:
+          ref: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable Phase 4 witness and derivation
+        uses: actions/checkout@v4
+        with:
+          ref: be231de35e8be02500849785f32616eb001bbfca
+          path: research
+          persist-credentials: false
+      - name: Check out immutable Phase 4B witness and derivation
+        uses: actions/checkout@v4
+        with:
+          ref: 2d2dca1605a569491b3c5b2229828a4412458e33
+          path: phase4b
+          persist-credentials: false
+      - name: Check out immutable original upstream
+        uses: actions/checkout@v4
+        with:
+          ref: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          path: upstream
+          persist-credentials: false
+      - name: Install Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Reproduce pinned Phase 4B source and normalized certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a3394130fe4f7b1df6ffdeffda16601795d9ce4
+          test "$(git -C ../harness rev-parse HEAD)" = 568c2f0ac41c60ff98c56b9da54aea9c56899bfc
+          test "$(git -C ../research rev-parse HEAD)" = be231de35e8be02500849785f32616eb001bbfca
+          test "$(git -C ../phase4b rev-parse HEAD)" = 2d2dca1605a569491b3c5b2229828a4412458e33
+          python3 ../harness/.github/scripts/derive_micro_candidate.py \
+            --root . --report micro-derived-input-report.json > phase4b-freeze-micro-derive.log 2>&1
+          python3 ../harness/.github/scripts/normalize_derived_multipliers.py \
+            --root . --derive-report micro-derived-input-report.json \
+            --report micro-normalization-report.json \
+            --csv micro-normalization-per-leaf.csv > phase4b-freeze-normalize.log 2>&1
+          python3 ../research/.github/scripts/derive_phase4_from_normalized_micro.py \
+            --root . --witnesses ../research/.github/phase4/phase4_five_normalized_certificates.json \
+            --report phase4-derived-report.json > phase4b-freeze-phase4-derive.log 2>&1
+          base64 -d ../phase4b/.github/phase4b/five_leaf_integer_rational_witnesses.json.gz.b64 > phase4b-five-witnesses.json.gz
+          test "$(sha256sum phase4b-five-witnesses.json.gz | cut -d' ' -f1)" = 6d221790384819fa59785c703a05d9b92edaab979d7ef8b71be599a42ba36ecd
+          python3 ../phase4b/.github/scripts/derive_phase4b_from_phase4.py \
+            --root . --witnesses phase4b-five-witnesses.json.gz \
+            --report phase4b-derived-report.json > phase4b-freeze-derive.log 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          from fractions import Fraction as Q
+          import hashlib,json,sys
+          sys.path[:0]=[str(Path('scripts').resolve()),str(Path('scripts/upper').resolve())]
+          from common import ROOT,source_snapshot
+          from exact import inputs,H
+          from export import export
+          r=json.loads(Path('phase4b-derived-report.json').read_text())
+          assert r['status']=='PHASE4B_DERIVED_EXACT_INPUTS_NOT_YET_LEAN_PROOF'
+          assert r['leaves']==12663 and r['all_LB_equal_1'] is True
+          assert r['changed_leaves']==[2056,4093,7875,9312,11786]
+          assert r['changed_leaf_geometry_valid_exact'] is True
+          assert r['changed_leaf_rows']==2990
+          assert r['normalized_certificate_files_updated']==50
+          assert r['delta2']==r['delta3']=='7/50000000'
+          assert r['area_exact']=='985957101148325639719241171/4002552364734000000000000000'
+          assert r['based_on_phase4_source_fingerprint']=='24369c3b0e4ce582a64a28891d923de11cbad91ee7603064c4ea6186d4a897a8'
+          assert r['based_on_phase4_certificate_fingerprint']=='c2650647317eaee181d53e447acd3e0f5f86f39a48d1f07fd40c6d6b800de594'
+          assert source_snapshot()['sha256']==r['source_fingerprint']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          cert,header,_=inputs(ROOT/'certificates/upper')
+          assert cert['sha256']==r['certificate_fingerprint']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          assert header['complete'] is True and header['leaves']==12663
+          assert H==[Q(0),Q(0),Q('130783/250000')-Q(7,50000000),Q('446199/1000000')-Q(7,50000000)]
+          out=ROOT/'MoserWorm/UpperBound/Certificate/Generated'
+          m=export(ROOT/'certificates/upper',out)
+          assert m['complete'] and m['shards']==1583 and len(m['modules'])==1636
+          assert m['inputs']==cert
+          manifest_sha=hashlib.sha256((out/'manifest.json').read_bytes()).hexdigest()
+          assert manifest_sha=='e9e22c2ca8bd9660b78ed8174af5f46cb93f1c3372d5d0e45e759bc5c4678e75',manifest_sha
+          print('PHASE4B_FREEZE_EXACT_SOURCE_CERTIFICATE_MANIFEST_PASS',flush=True)
+          print('PHASE4B_FREEZE_NO_LEAN_RECOMPILATION_PERFORMED',flush=True)
+          PY
+      - name: Package and independently verify all archived files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee phase4b-freeze-packaging.log
+          from pathlib import Path
+          import hashlib,json,subprocess,zipfile
+          root=Path.cwd();base=root.parent
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          tracked=[Path(p.decode('utf8')) for p in subprocess.check_output(['git','ls-files','-z'],cwd=root).split(b'\0') if p]
+          # Immutable upstream contains 1170 tracked paths; do not incorrectly cap this at 500.
+          assert len(tracked)==1170,('tracked count',len(tracked))
+          names={p.as_posix() for p in tracked}
+          required={'certificates/upper/header.json','certificates/upper/manifest.json',
+             'certificates/upper/tree.json.gz','MoserWorm/UpperBound/Shape.lean',
+             'MoserWorm/UpperBound/Certificate/Spec.lean','MoserWorm/MainTheorem.lean',
+             'scripts/upper/exact.py'}
+          required|={f'certificates/upper/multipliers-{i:03d}.jsonl.gz' for i in range(50)}
+          assert required<=names, sorted(required-names)
+          entries={}
+          for p in tracked:
+              assert not p.is_absolute() and '..' not in p.parts
+              assert (root/p).is_file(),p
+              entries['derived-upstream/'+p.as_posix()]=(root/p).read_bytes()
+          extras={
+            'scripts/micro/derive_micro_candidate.py':base/'harness/.github/scripts/derive_micro_candidate.py',
+            'scripts/micro/normalize_derived_multipliers.py':base/'harness/.github/scripts/normalize_derived_multipliers.py',
+            'scripts/phase4/derive_phase4_from_normalized_micro.py':base/'research/.github/scripts/derive_phase4_from_normalized_micro.py',
+            'scripts/phase4/phase4_five_normalized_certificates.json':base/'research/.github/phase4/phase4_five_normalized_certificates.json',
+            'scripts/phase4b/derive_phase4b_from_phase4.py':base/'phase4b/.github/scripts/derive_phase4b_from_phase4.py',
+            'scripts/phase4b/five_leaf_integer_rational_witnesses.json.gz.b64':base/'phase4b/.github/phase4b/five_leaf_integer_rational_witnesses.json.gz.b64',
+            'evidence/phase4b-five-witnesses.json.gz':root/'phase4b-five-witnesses.json.gz',
+          }
+          for dest,p in extras.items():
+              assert p.is_file(),p
+              entries[dest]=p.read_bytes()
+          evidence=['micro-derived-input-report.json','micro-normalization-report.json',
+               'micro-normalization-per-leaf.csv','phase4-derived-report.json','phase4b-derived-report.json',
+               'phase4b-freeze-micro-derive.log','phase4b-freeze-normalize.log',
+               'phase4b-freeze-phase4-derive.log','phase4b-freeze-derive.log']
+          for name in evidence:entries['evidence/'+name]=(root/name).read_bytes()
+          entries['evidence/generated-manifest.json']=(root/'MoserWorm/UpperBound/Certificate/Generated/manifest.json').read_bytes()
+          r=json.loads(entries['evidence/phase4b-derived-report.json'])
+          assert r['source_fingerprint']=='82f3c4219153481422fbf6902746fca0c5c6d9b77c06188228a6e5d23f74ef83'
+          assert r['certificate_fingerprint']=='7b55d269fff82347e8b8cb4997e36d9cb175d8bba8c320b5b9fd4fccc3fbe400'
+          entries['README.md']=(
+            '# Phase 4B frozen derived inputs / Kazuma Iwai\n\n'
+            'This archive preserves source and certificates from the successful Phase 4B Lean integration.\n'
+            'It does not itself rerun Lean or constitute an independent mathematical peer review.\n'
+            'Source commit: 9a3394130fe4f7b1df6ffdeffda16601795d9ce4\n'
+            'Micro harness: 568c2f0ac41c60ff98c56b9da54aea9c56899bfc\n'
+            'Phase4 scripts: be231de35e8be02500849785f32616eb001bbfca\n'
+            'Phase4B scripts and witnesses: 2d2dca1605a569491b3c5b2229828a4412458e33\n'
+            'delta2 = delta3 = 7/50000000\n'
+            'Exact area = 985957101148325639719241171/4002552364734000000000000000\n'
+            'Proof artifacts: Phase 4B full-integration GitHub Actions run, 4 olean ZIP and final ZIP.\n'
+          ).encode()
+          files={name:{'sha256':sha(data),'bytes':len(data)} for name,data in sorted(entries.items())}
+          index={'schema':1,'status':'PHASE4B_RECONSTRUCTED_INPUTS_IDENTICAL_FINGERPRINTS',
+             'source_fingerprint':r['source_fingerprint'],'certificate_fingerprint':r['certificate_fingerprint'],
+             'generated_manifest_sha256':sha(entries['evidence/generated-manifest.json']),
+             'delta2':r['delta2'],'delta3':r['delta3'],'exact_area':r['area_exact'],
+             'upstream_commit':'9a3394130fe4f7b1df6ffdeffda16601795d9ce4',
+             'phase4b_commit':'2d2dca1605a569491b3c5b2229828a4412458e33',
+             'tracked_source_files':len(tracked),'files':files}
+          entries['ARCHIVE_INDEX.json']=(json.dumps(index,indent=2,sort_keys=True)+'\n').encode()
+          dest=root/'phase4b-adjusted-derived-inputs.zip'
+          with zipfile.ZipFile(dest,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for name,data in sorted(entries.items()):
+                  zi=zipfile.ZipInfo(name,date_time=(2026,10,29,0,0,0))
+                  zi.compress_type=zipfile.ZIP_DEFLATED
+                  zi.external_attr=0o644<<16
+                  z.writestr(zi,data,compress_type=zipfile.ZIP_DEFLATED,compresslevel=6)
+          with zipfile.ZipFile(dest) as z:
+              assert z.testzip() is None
+              got=json.loads(z.read('ARCHIVE_INDEX.json'))
+              assert len(got['files'])==len(z.namelist())-1
+              for name,rec in got['files'].items():
+                  blob=z.read(name)
+                  assert len(blob)==rec['bytes'] and sha(blob)==rec['sha256'],name
+          digest=sha(dest.read_bytes())
+          (root/'phase4b-adjusted-derived-inputs.sha256.txt').write_text(digest+'  '+dest.name+'\n')
+          print('PHASE4B_DERIVED_INPUT_ARCHIVE_INTEGRITY_PASS',len(tracked),len(entries),flush=True)
+          print('PHASE4B_ARCHIVE_SHA256',digest,flush=True)
+          print('PHASE4B_ARCHIVE_BYTES',dest.stat().st_size,flush=True)
+          PY
+      - name: Upload preserved derived inputs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4b-adjusted-derived-source-certificate
+          path: |
+            upstream/phase4b-adjusted-derived-inputs.zip
+            upstream/phase4b-adjusted-derived-inputs.sha256.txt
+            upstream/phase4b-freeze-packaging.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve diagnostics if failing
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4b-freeze-diagnostics
+          path: |
+            upstream/phase4b-freeze-*.log
+            upstream/phase4b-derived-report.json
+            upstream/phase4-derived-report.json
+          if-no-files-found: warn
+          retention-days: 14
